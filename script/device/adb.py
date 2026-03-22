@@ -19,6 +19,70 @@ from script.loot.utils import clamp
 
 _CAPTURE_OBJ: Optional[ScreenCapture] = None
 
+class FastADB:
+    def __init__(self, device_id: Optional[str] = None):
+        self.device_id = device_id
+        self.process: Optional[subprocess.Popen] = None
+        self._start_shell()
+
+    def _start_shell(self):
+        if self.process:
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+                self.process.terminate()
+                self.process.wait(timeout=1.0)
+            except:
+                try:
+                    self.process.kill()
+                except:
+                    pass
+        cmd = ["adb"]
+        if self.device_id:
+            cmd.extend(["-s", str(self.device_id)])
+        cmd.append("shell")
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            text=True
+        )
+        log(f"[INFO] Persistent ADB shell started for {self.device_id or 'default'}")
+
+    def run_cmd(self, cmd_str: str):
+        if not self.process or self.process.poll() is not None:
+            self._start_shell()
+        
+        proc = self.process
+        if not proc or not proc.stdin:
+            log("[ERROR] FastADB process or stdin is missing")
+            return
+
+        try:
+            proc.stdin.write(cmd_str + "\n")
+            proc.stdin.flush()
+        except Exception as e:
+            log(f"[ERROR] FastADB write failed: {e}")
+            self._start_shell()
+            proc = self.process
+            if proc and proc.stdin:
+                try:
+                    proc.stdin.write(cmd_str + "\n")
+                    proc.stdin.flush()
+                except:
+                    log("[ERROR] FastADB recovery failed")
+
+
+_FAST_ADB: Optional[FastADB] = None
+
+def get_fast_adb() -> FastADB:
+    global _FAST_ADB
+    if _FAST_ADB is None:
+        _FAST_ADB = FastADB(DEVICE_ID)
+    return _FAST_ADB
+
 def get_capture() -> ScreenCapture:
     global _CAPTURE_OBJ
     if _CAPTURE_OBJ is None:
@@ -73,7 +137,7 @@ def tap(x: int, y: int, reason: str = ""):
             time.sleep(SLEEP_AFTER_TAP)
             return
         try:
-            adb_cmd(["shell", "input", "tap", str(x), str(y)])
+            get_fast_adb().run_cmd(f"input touchscreen tap {x} {y}")
             log(f"TAP at ({x},{y}){'  // ' + reason if reason else ''}")
         except Exception as e:
             log(f"[ERROR] tap adb failed: {e}")
@@ -87,7 +151,7 @@ def tap_raw(x: int, y: int, reason: str = ""):
             time.sleep(SLEEP_AFTER_TAP)
             return
         try:
-            adb_cmd(["shell", "input", "tap", str(int(x)), str(int(y))])
+            get_fast_adb().run_cmd(f"input touchscreen tap {int(x)} {int(y)}")
             log(f"TAP_RAW at ({x},{y}){'  // ' + reason if reason else ''}")
         except Exception as e:
             log(f"[ERROR] tap_raw adb failed: {e}")
@@ -102,7 +166,7 @@ def tap_fast(x: int, y: int, reason: str = ""):
             log(f"DRY_RUN TAP_FAST at ({x},{y}){'  // ' + reason if reason else ''}")
             return
         try:
-            adb_cmd(["shell", "input", "tap", str(x), str(y)])
+            get_fast_adb().run_cmd(f"input touchscreen tap {x} {y}")
             log(f"TAP_FAST at ({x},{y}){'  // ' + reason if reason else ''}")
         except Exception as e:
             log(f"[ERROR] tap_fast adb failed: {e}")
@@ -166,14 +230,10 @@ def device_swipe(dx: int, dy: int, duration_ms: int):
 
     if not DRY_RUN:
         try:
-            adb_cmd(
-                [
-                    "shell", "input", "swipe",
-                    str(int(x_anchor)), str(int(y_from)),
-                    str(int(x_to)), str(int(y_to)),
-                    str(int(dur)),
-                ]
+            get_fast_adb().run_cmd(
+                f"input touchscreen swipe {int(x_anchor)} {int(y_from)} {int(x_to)} {int(y_to)} {int(dur)}"
             )
+            log(f"SWIPE from ({int(x_anchor)},{int(y_from)}) to ({int(x_to)},{int(y_to)}) speed={dur}ms")
         except Exception as e:
             log(f"[ERROR] swipe adb failed: {e}")
 
@@ -183,3 +243,4 @@ def device_swipe(dx: int, dy: int, duration_ms: int):
         post = screenshot_bgr()
         if post is not None:
             snap("swipe_after", post, points=[(int(x_anchor), int(y_from)), (int(x_to), int(y_to))])
+
