@@ -1,0 +1,425 @@
+# C:/bot/script/loot/victory_drop.py
+# -*- coding: utf-8 -*-
+import os
+from typing import Dict, List, Tuple, Optional, Set
+
+import cv2
+import numpy as np
+
+# Жёстких зависимостей от внутренних структур не делаем — только публичные.
+from script.loot import tpl_loader as TL
+from script.loot.matcher import find_all_matches, preprocess_gray
+from script.loot import auto_bot
+_IMG_CACHE: Dict[str, np.ndarray] = {}
+# Fallback ROI, если не нашли кнопку
+roi_icons = (0, 1080, 1000, 1500)  # x1, x2, y1, y2
+
+
+# Типы
+Match = Tuple[int, int, int, int, float, str]  # (x,y,w,h,score,tpl_path)
+
+
+def _structured_log(step: str, **payload):
+    try:
+        auto_bot.structured_log(step, **payload)
+    except Exception:
+        pass
+
+
+def _to_gray(img: np.ndarray, mode: str = "gray") -> np.ndarray:
+    return preprocess_gray(img, mode=mode)
+
+
+def _rect_from_rel(W: int, H: int, rel: List[float]) -> Tuple[int, int, int, int]:
+    x1 = int(rel[0] * W)
+    y1 = int(rel[1] * H)
+    x2 = int(rel[2] * W)
+    y2 = int(rel[3] * H)
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def _ensure_rel(rel: Optional[List[float]], fallback: List[float]) -> List[float]:
+    if isinstance(rel, list) and len(rel) == 4:
+        return rel
+    return fallback
+
+
+def _cfg(cfg: Dict, *path, default=None):
+    cur = cfg
+    try:
+        for p in path:
+            cur = cur[p]
+        return cur
+    except Exception:
+        return default
+
+
+def _build_registry_index(reg: Dict[str, dict]) -> Dict[str, Tuple[str, str]]:
+    """
+    Индекс по абсолютному пути к tpl:
+      path -> (group, name)  где group в виде 'item.icon', 'item.name', ...
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    for k, v in reg.items():
+        if not isinstance(v, dict):
+            # Нормализатор уже должен был завернуть строки, но защитимся
+            continue
+        p = v.get("tpl")
+        g = v.get("group")
+        if not p or not g:
+            continue
+        # Безопасная нормализация ключа
+        stem_key = k
+        try:
+            stem_key = TL._nfkc_lower(k)
+        except Exception as e:
+            _structured_log("victory_nfkc_lower_fail", key=k, error=str(e))
+        out[p.replace("\\", "/")] = (g, stem_key.split(".", 2)[-1])
+    return out
+
+
+def _collect_icon_templates(reg: Dict[str, dict]) -> List[Tuple[str, np.ndarray]]:
+    """
+    Берём только иконки дропа:
+      - item.icon.*
+      - rune.icon.*
+    Возвращаем список (path, img_bgr).
+    """
+    icons: List[Tuple[str, np.ndarray]] = []
+    for k, v in reg.items():
+        if not isinstance(v, dict):
+            continue
+        g = v.get("group") or ""
+        if not (g.startswith("item.icon") or g.startswith("rune.icon")):
+            continue
+        p = v.get("tpl")
+        if not p:
+            continue
+
+        key = p.replace("\\", "/")
+        img = _IMG_CACHE.get(key)
+
+        if img is None:
+            # Сначала пробуем приватный хелпер; при сбое — fallback на cv2.imread
+            try:
+                img = TL._imread_u8(p, cv2.IMREAD_COLOR)
+            except Exception as e:
+                _structured_log("victory_icon_imread_fail", path=p, error=str(e))
+                img = None
+            if img is None:
+                img = cv2.imread(p, cv2.IMREAD_COLOR)
+            if img is None:
+                _structured_log("victory_icon_load_fail", path=p)
+                continue
+            _IMG_CACHE[key] = img
+
+        icons.append((key, img))
+
+    _structured_log("victory_icons_loaded", count=len(icons))
+    return icons
+
+def _detect_continue_box(frame_bgr: np.ndarray, cfg: Dict) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Ищем кнопку CONTINUE по шаблону, чтобы от этого якоря построить ROI дропа.
+    Если не найдём — вернём None (перейдём к fallback ROI).
+    """
+    path = _cfg(cfg, "TEMPLATES_PATHS", "CONTINUE") or _cfg(cfg, "TEMPLATES", "CONTINUE")
+    if not path or not os.path.exists(path):
+        return None
+
+    key = path.replace("\\", "/")
+    tpl = _IMG_CACHE.get(key)
+    if tpl is None:
+        try:
+            tpl = TL._imread_u8(path, cv2.IMREAD_COLOR)
+        except Exception:
+            tpl = None
+        if tpl is None:
+            tpl = cv2.imread(path, cv2.IMREAD_COLOR)
+        if tpl is None:
+            return None
+        _IMG_CACHE[key] = tpl
+
+    thr = float(_cfg(cfg, "FIGHT", "THRESHOLDS", "continue_btn", default=0.82))
+    scales = list(_cfg(cfg, "FIND", "ITEM_SCALES", default=[0.9, 0.95, 1.0, 1.05]))
+    roi_gray = _to_gray(frame_bgr, mode=_cfg(cfg, "FIND", "PREPROC_MODE", default="gray") or "gray")
+    tpl_gray = _to_gray(tpl, mode=_cfg(cfg, "FIND", "PREPROC_MODE", default="gray") or "gray")
+
+    H, W = roi_gray.shape[:2]
+    best = (None, -1.0, None)  # (rect, score, scale)
+    for s in scales:
+        tw = max(5, int(round(tpl_gray.shape[1] * s)))
+        th = max(5, int(round(tpl_gray.shape[0] * s)))
+        if th > H or tw > W:
+            continue
+        tgs = cv2.resize(tpl_gray, (tw, th), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(roi_gray, tgs, cv2.TM_CCOEFF_NORMED)
+        minV, maxV, minL, maxL = cv2.minMaxLoc(res)
+        if maxV >= thr and maxV > best[1]:
+            x, y = maxL
+            best = ((int(x), int(y), int(tw), int(th)), float(maxV), s)
+
+    if best[0] is None:
+        _structured_log("victory_continue_not_found")
+        return None
+
+    x, y, w, h = best[0]
+    _structured_log("victory_continue_found", box=[x, y, w, h], score=best[1], scale=best[2])
+    return x, y, w, h
+
+def _compute_drop_roi(frame_bgr: np.ndarray, continue_box: Optional[Tuple[int, int, int, int]], cfg: Dict) -> Tuple[int, int, int, int]:
+    """
+    ROI иконок дропа на экране победы.
+
+    Приоритет:
+      1) Абсолютный ROI из CFG.ROI.VICTORY_DROP_ABS = [x1,y1,x2,y2] (если задан).
+      2) ROI-полоса над кнопкой CONTINUE (если найдена).
+      3) Жёсткий fallback ROI (0..1080, 1000..1500).
+      4) Относительный fallback из CFG.ROI.VICTORY_DROP_REL (как в коде раньше).
+    """
+    H, W = frame_bgr.shape[:2]
+
+    # 1) Абсолютный ROI (если явно задан в конфиге)
+    abs_roi = _cfg(cfg, "ROI", "VICTORY_DROP_ABS")
+    if isinstance(abs_roi, list) and len(abs_roi) == 4:
+        x1, y1, x2, y2 = [int(v) for v in abs_roi]
+        x1 = _clamp(x1, 0, W)
+        x2 = _clamp(x2, 0, W)
+        y1 = _clamp(y1, 0, H)
+        y2 = _clamp(y2, 0, H)
+        if x2 > x1 and y2 > y1:
+            x, y, w, h = x1, y1, x2 - x1, y2 - y1
+            _structured_log("victory_drop_roi_abs_cfg", roi=[x, y, w, h])
+            return x, y, w, h
+
+    # 2) Полоса над CONTINUE (если нашлась)
+    if continue_box:
+        cx, cy, cw, ch = continue_box
+        y2 = _clamp(cy - 8, 0, H)
+        y1 = _clamp(y2 - int(ch * 1.6), 0, y2)
+        x1 = max(0, int(W * 0.08))
+        x2 = min(W, int(W * 0.92))
+        x, y, w, h = x1, y1, x2 - x1, y2 - y1
+        if h >= 20:
+            _structured_log("victory_drop_roi_from_continue", roi=[x, y, w, h])
+            return x, y, w, h
+
+    # 3) Жёсткий fallback ROI, согласованный (x: 0..1080, y: 1000..1500)
+    hard_x1, hard_y1, hard_x2, hard_y2 = 0, 1000, 1080, 1500
+    hx1 = _clamp(hard_x1, 0, W)
+    hx2 = _clamp(hard_x2, 0, W)
+    hy1 = _clamp(hard_y1, 0, H)
+    hy2 = _clamp(hard_y2, 0, H)
+    if hx2 > hx1 and hy2 > hy1:
+        x, y, w, h = hx1, hy1, hx2 - hx1, hy2 - hy1
+        _structured_log("victory_drop_roi_hard_fallback", roi=[x, y, w, h])
+        return x, y, w, h
+
+    # 4) Относительный fallback
+    rel = _cfg(cfg, "ROI", "VICTORY_DROP_REL")
+    rel = _ensure_rel(rel, fallback=[0.08, 0.52, 0.92, 0.86])
+    x, y, w, h = _rect_from_rel(W, H, rel)
+    _structured_log("victory_drop_roi_rel_fallback", roi=[x, y, w, h])
+    return x, y, w, h
+
+def _match_icons_in_roi(frame_bgr: np.ndarray,
+                        roi_xywh: Tuple[int, int, int, int],
+                        icons: List[Tuple[str, np.ndarray]],
+                        cfg: Dict) -> List[Match]:
+    """
+    Находит все вхождения иконок в ROI екрна победы.
+    Возвращает список детекций с координатами и путём шаблона.
+    """
+    x, y, w, h = roi_xywh
+    crop = frame_bgr[y:y + h, x:x + w]
+    if crop.size == 0:
+        return []
+
+    mode = _cfg(cfg, "FIND", "PREPROC_MODE", default="gray") or "gray"
+    roi_proc = _to_gray(crop, mode=mode)
+    scales = list(_cfg(cfg, "FIND", "ITEM_SCALES", default=[0.9, 0.95, 1.0, 1.05]))
+    thr = float(_cfg(cfg, "MATCH", "tab_btn", default=0.85))  # разумный дефолт
+    thr = float(_cfg(cfg, "FIND", "THRESHOLD", default=thr))
+    min_dy = int(_cfg(cfg, "FIND", "MIN_DY", default=10))
+
+    matches: List[Match] = []
+    for tpl_path, img in icons:
+        tpl_proc = _to_gray(img, mode=mode)
+        hits = find_all_matches(roi_proc, tpl_proc, scales=scales, threshold=thr, min_dy=min_dy)
+        for mx, my, s, score in hits:
+            tw = max(5, int(round(tpl_proc.shape[1] * s)))
+            th = max(5, int(round(tpl_proc.shape[0] * s)))
+            matches.append((x + mx, y + my, tw, th, float(score), tpl_path))
+    matches.sort(key=lambda r: (r[1], -r[4]))
+    _structured_log("victory_drop_matches", count=len(matches))
+    return matches
+
+
+def _icon_path_to_item_name_filename(icon_tpl_path: str,
+                                     reg_index: Dict[str, Tuple[str, str]]) -> Optional[str]:
+    """
+    Преобразуем путь иконки (item.icon.X или rune.icon.X) в имя файла name‑шаблона (X_name.png),
+    опираясь на registry.
+    """
+    icon_tpl_path = icon_tpl_path.replace("\\", "/")
+    meta = reg_index.get(icon_tpl_path)
+    if not meta:
+        _structured_log("victory_icon_meta_missing", icon_path=icon_tpl_path)
+        return None
+
+    group, stem = meta  # group like 'item.icon' or 'rune.icon'
+    if group.startswith("item.icon"):
+        name_key = f"item.name.{stem}"
+    elif group.startswith("rune.icon"):
+        name_key = f"rune.name.{stem}"
+    else:
+        _structured_log("victory_icon_group_unhandled", group=group, stem=stem)
+        return None
+
+    # Безопасная нормализация ключа
+    norm_key = name_key
+    try:
+        norm_key = TL._nfkc_lower(name_key)
+    except Exception as e:
+        _structured_log("victory_nfkc_lower_fail", key=name_key, error=str(e))
+
+    # Прямое совпадение
+    val = TL.REG.get(norm_key)
+    if not isinstance(val, dict):
+        # Fallback: ищем по нижнему регистру среди всех ключей
+        for k in TL.REG.keys():
+            if k.lower() == norm_key.lower():
+                val = TL.REG[k]
+                break
+
+    if isinstance(val, dict):
+        name_path = val.get("tpl")
+        if name_path:
+            return os.path.basename(name_path)
+
+    _structured_log("victory_name_template_missing", key=norm_key)
+    return None
+
+def scan_victory_drop_targets(frame_bgr: np.ndarray, cfg: Dict) -> Dict:
+    """
+    Сканирует экран победы, ищет иконки дропа, фильтрует по whitelist.
+    Возвращает словарь:
+      {
+        "loot_found": bool,            # есть ли вообще лут из whitelist
+        "allowed_loot_ids": List[str], # список файлов name-шаблонов без дубликатов
+        "detected_all": List[str]      # все найденные имена (basename name‑шаблонов)
+      }
+
+    ВАЖНО: whitelist (CFG.ALLOWED_ITEM_NAMES) может содержать как basename name‑шаблонов (…_name.png),
+           так и basename icon‑файлов (…_icon.png). Мы допускаем оба варианта.
+           В allowed_loot_ids всегда возвращаем basename name‑шаблонов.
+    """
+    # Шаг 1. REG + индексы/иконки
+    reg = getattr(TL, "REG", {}) or {}
+    if not isinstance(reg, dict) or not reg:
+        _structured_log("victory_registry_unavailable")
+        return {"loot_found": False, "allowed_loot_ids": [], "detected_all": []}
+
+    reg_index = _build_registry_index(reg)
+    icons = _collect_icon_templates(reg)
+
+    # Шаг 2. ROI
+    cont_box = _detect_continue_box(frame_bgr, cfg)
+    roi = _compute_drop_roi(frame_bgr, cont_box, cfg)
+
+    # Шаг 3. Матчинг иконок
+    matches = _match_icons_in_roi(frame_bgr, roi, icons, cfg)
+    if not matches:
+        _structured_log("victory_drop_no_icons_in_roi")
+        return {"loot_found": False, "allowed_loot_ids": [], "detected_all": []}
+
+    # Шаг 4. Перевод иконок -> filename name‑шаблона + сбор icon‑basename
+    names: List[str] = []       # basename name‑шаблонов (…_name.png)
+    icons_base: List[str] = []  # basename иконок (…_icon.png)
+    for _, _, _, _, score, tpl_path in matches:
+        # basename иконки
+        icon_base = os.path.basename(tpl_path)
+        icons_base.append(icon_base)
+        # маппинг на name‑шаблон
+        fn = _icon_path_to_item_name_filename(tpl_path, reg_index)
+        if fn:
+            names.append(fn)
+        else:
+            _structured_log("victory_icon_to_name_missing", icon_path=tpl_path)
+
+    # Уникализация порядка
+    def _uniq_keep_order(seq: List[str]) -> List[str]:
+        out, seen = [], set()
+        for s in seq:
+            if s not in seen:
+                out.append(s); seen.add(s)
+        return out
+
+    names_unique = _uniq_keep_order(names)
+    icons_unique = _uniq_keep_order(icons_base)
+
+    # Шаг 5. Фильтрация по whitelist — допускаем оба формата
+    wl_raw = list(auto_bot.CFG.get("ALLOWED_ITEM_NAMES", []))
+    wl = set(wl_raw)
+
+    # Правило: name попадает в allowed, если либо сам name в wl, либо соответствующая icon‑basename в wl.
+    # Для связи name<->icon нам понадобится мэп: icon_base -> mapped_name (если есть).
+    icon_to_name: Dict[str, Optional[str]] = {}
+    for _, _, _, _, _, tpl_path in matches:
+        icon_base = os.path.basename(tpl_path)
+        name_base = _icon_path_to_item_name_filename(tpl_path, reg_index)
+        icon_to_name[icon_base] = name_base
+
+    allowed: List[str] = []
+    for name_base in names_unique:
+        # Найдём любую иконку, которая мапится в этот name
+        related_icons = [ib for ib, nb in icon_to_name.items() if nb == name_base]
+        icon_match = any(ib in wl for ib in related_icons)
+        if (name_base in wl) or icon_match:
+            allowed.append(name_base)
+
+    filter_applied = bool(wl)
+    loot_found = bool(allowed)
+
+    # Диагностика причин отсутствия лута
+    if not loot_found:
+        if not names_unique:
+            _structured_log("victory_no_loot_detected", reason="no_icons_detected")
+        elif wl and not allowed:
+            _structured_log("victory_no_loot_detected", reason="no_whitelist_match",
+                            detected_names=names_unique, detected_icons=icons_unique, wl_size=len(wl))
+        else:
+            _structured_log("victory_no_loot_detected", reason="empty_allowed_list")
+
+    _structured_log(
+        "victory_drop_targets",
+        detected=names_unique,           # name‑basename
+        detected_icons=icons_unique,     # icon‑basename
+        allowed=allowed,                 # name‑basename, прошедшие фильтр
+        whitelist_size=len(wl),
+        whitelist_sample=wl_raw[:10],
+        filter_applied=filter_applied,
+        loot_found=loot_found
+    )
+
+    return {
+        "loot_found": loot_found,
+        "allowed_loot_ids": allowed,     # ВАЖНО: тут возвращаем name‑basename
+        "detected_all": names_unique
+    }
+
+
+
+def set_victory_targets_from_frame(frame_bgr: np.ndarray) -> Dict:
+    try:
+        cfg = auto_bot.CFG
+    except Exception:
+        cfg = {}
+    drop_info = scan_victory_drop_targets(frame_bgr, cfg)
+    auto_bot.set_victory_targets(drop_info["allowed_loot_ids"])
+    return drop_info
+

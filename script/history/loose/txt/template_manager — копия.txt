@@ -1,0 +1,7 @@
+def auto_update_templates(screen, tpl_folder):
+    for filename in os.listdir(tpl_folder):
+        if filename.endswith('.png'):
+            path = os.path.join(tpl_folder, filename)
+            img = cv2.imread(path, 0)
+            if img is None or img.shape[0] < 10:
+                print(f'⚠️ Повреждён шаблон: {filename}')

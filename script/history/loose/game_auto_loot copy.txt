@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+import os
+import time
+import math
+from typing import Optional, Tuple, Dict, Any
+
+import cv2
+import numpy as np
+
+from adb_actions import ADB
+
+
+class Cfg:
+    # Папка с шаблонами PNG (например: assets/items_label.png, assets/pickup_active.png, ...)
+    ASSETS = os.path.join(os.getcwd(), "tpl\my")
+    DEBUG_DIR = os.path.join(os.getcwd(), "_debug")
+
+    # Пороги сопоставления
+    THRESH_STRICT = 0.87
+    THRESH_NORMAL = 0.82
+
+    # Геометрия грида предметов (пример — отвалидируй под свой экран один раз)
+    # ROI: (x1, y1, x2, y2) — прямоугольник инвентаря/списка предметов
+    GRID_ROI = (120, 500, 960, 1900)   # ПРИМЕР. Обнови под свой UI.
+    GRID_COLS = 5
+    GRID_ROWS = 4
+    GRID_ORDER = "row-major"           # Или "col-major" — как удобнее обходить
+
+    # Имена шаблонов (положи их в assets/)
+    TPL_ITEMS_LABEL = "items_tab"         # метка раздела/вкладки предметов (верхняя надпись)
+    TPL_PICKUP_ACTIVE = "pickup"     # кнопка "подобрать" активная
+    TPL_PICKUP_INACTIVE = "pickup_other" # кнопка "подобрать" неактивная
+    TPL_CLOSE_CROSS = "close_cross"         # крестик закрытия попапа (если есть)
+    TPL_POPUP_TITLE = "popup_yantar_1"         # заголовок попапа предмета (если есть)
+
+    # Задержки
+    WAIT_AFTER_TAP = 0.12
+    WAIT_AFTER_OPEN = 0.25
+    WAIT_AFTER_PICKUP = 0.25
+
+
+# ---------- Утилиты ----------
+
+def ensure_dir(path: str):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def now_ts() -> str:
+    import datetime as _dt
+    return _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def asset_path(name: str) -> str:
+    # name без .png
+    return os.path.join(Cfg.ASSETS, f"{name}.png")
+
+
+def save_debug(img: np.ndarray, label: str, rects: Optional[list] = None, points: Optional[list] = None):
+    ensure_dir(Cfg.DEBUG_DIR)
+    vis = img.copy()
+    if rects:
+        for (x, y, w, h), color in rects:
+            cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+    if points:
+        for (cx, cy), color in points:
+            cv2.circle(vis, (int(cx), int(cy)), 8, color, 2)
+    # Подпись
+    cv2.putText(vis, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (40, 220, 40), 2, cv2.LINE_AA)
+    fn = os.path.join(Cfg.DEBUG_DIR, f"{now_ts()}_{label}.png")
+    cv2.imwrite(fn, vis)
+
+
+def load_tpl(name: str) -> Optional[np.ndarray]:
+    p = asset_path(name)
+    if not os.path.isfile(p):
+        print(f"[TPL] Нет файла: {p}")
+        return None
+    tpl = cv2.imread(p, cv2.IMREAD_COLOR)
+    if tpl is None or tpl.size == 0:
+        print(f"[TPL] Не удалось загрузить: {p}")
+        return None
+    return tpl
+
+
+def match_one(img: np.ndarray, tpl: np.ndarray, thr: float, roi: Optional[Tuple[int, int, int, int]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает dict с полями: rect=(x,y,w,h), center=(cx,cy), score=float
+    """
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        crop = img[y1:y2, x1:x2]
+        offset = (x1, y1)
+    else:
+        crop = img
+        offset = (0, 0)
+
+    res = cv2.matchTemplate(crop, tpl, cv2.TM_CCOEFF_NORMED)
+    minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
+    if maxVal < thr:
+        return None
+    th, tw = tpl.shape[:2]
+    top_left = (maxLoc[0] + offset[0], maxLoc[1] + offset[1])
+    rect = (top_left[0], top_left[1], tw, th)
+    center = (top_left[0] + tw // 2, top_left[1] + th // 2)
+    return {"rect": rect, "center": center, "score": float(maxVal)}
+
+
+def find_one(img: np.ndarray, name: str, thr: float, roi: Optional[Tuple[int, int, int, int]] = None) -> Optional[Dict[str, Any]]:
+    tpl = load_tpl(name)
+    if tpl is None:
+        return None
+    return match_one(img, tpl, thr, roi)
+
+
+# ---------- Логика UI ----------
+
+def popup_is_open(img: np.ndarray) -> bool:
+    # Попап считаем открытым, если видим активную/неактивную кнопку "подобрать" или заголовок
+    hit = find_one(img, Cfg.TPL_PICKUP_ACTIVE, Cfg.THRESH_NORMAL)
+    if hit:
+        return True
+    hit = find_one(img, Cfg.TPL_PICKUP_INACTIVE, Cfg.THRESH_NORMAL)
+    if hit:
+        return True
+    hit = find_one(img, Cfg.TPL_POPUP_TITLE, Cfg.THRESH_NORMAL)
+    return bool(hit)
+
+
+def detect_pickup_state(img: np.ndarray) -> str:
+    """
+    Возвращает: 'active' | 'inactive' | 'none'
+    """
+    if find_one(img, Cfg.TPL_PICKUP_ACTIVE, Cfg.THRESH_NORMAL):
+        return "active"
+    if find_one(img, Cfg.TPL_PICKUP_INACTIVE, Cfg.THRESH_NORMAL):
+        return "inactive"
+    return "none"
+
+
+def grid_cell_center(index: int) -> Tuple[int, int]:
+    """
+    Равномерная сетка по ROI. Индексация по строкам (row-major) по умолчанию.
+    """
+    x1, y1, x2, y2 = Cfg.GRID_ROI
+    cols, rows = Cfg.GRID_COLS, Cfg.GRID_ROWS
+    w = x2 - x1
+    h = y2 - y1
+    cell_w = w / float(cols)
+    cell_h = h / float(rows)
+
+    if Cfg.GRID_ORDER == "row-major":
+        r = index // cols
+        c = index % cols
+    else:
+        c = index // rows
+        r = index % rows
+
+    cx = int(x1 + c * cell_w + cell_w / 2.0)
+    cy = int(y1 + r * cell_h + cell_h / 2.0)
+    return cx, cy
+
+
+def open_item_popup_by_index(adb: ADB, index: int, attempts: int = 2) -> bool:
+    """
+    Открывает попап предмета нажатием по ячейке сетки (index).
+    """
+    for attempt in range(attempts):
+        img = adb.screencap_cv()
+        if img is None:
+            print("[open_item_popup_by_index] Нет скрина.")
+            time.sleep(0.1)
+            continue
+
+        if popup_is_open(img):
+            return True
+
+        label = find_one(img, Cfg.TPL_ITEMS_LABEL, Cfg.THRESH_STRICT)
+        if not label:
+            save_debug(img, f"open_item_{index}_no_items_label")
+            # Можно попробовать свайпнуть, если список уехал
+            time.sleep(0.2)
+            continue
+
+        cx, cy = grid_cell_center(index)
+        adb.tap(cx, cy)
+        time.sleep(Cfg.WAIT_AFTER_OPEN)
+
+        img2 = adb.screencap_cv()
+        if img2 is None:
+            continue
+        if popup_is_open(img2):
+            save_debug(img2, f"open_item_{index}_ok", points=[((cx, cy), (40, 220, 40))])
+            return True
+        else:
+            save_debug(img2, f"open_item_{index}_no_popup", points=[((cx, cy), (30, 30, 230))])
+    return False
+
+
+def pickup_current_if_possible(adb: ADB) -> bool:
+    """
+    Если кнопка 'подобрать' активна — нажимаем и ждём.
+    Возвращает True, если вроде собрали.
+    """
+    img = adb.screencap_cv()
+    if img is None:
+        return False
+
+    state = detect_pickup_state(img)
+    if state == "active":
+        btn = find_one(img, Cfg.TPL_PICKUP_ACTIVE, Cfg.THRESH_NORMAL)
+        if btn:
+            adb.tap(*btn["center"])
+            time.sleep(Cfg.WAIT_AFTER_PICKUP)
+            img2 = adb.screencap_cv()
+            save_debug(img2 if img2 is not None else img, "pickup_pressed")
+            return True
+    elif state == "inactive":
+        save_debug(img, "pickup_inactive")
+    else:
+        save_debug(img, "pickup_not_found")
+    return False
+
+
+def close_popup(adb: ADB):
+    """
+    Пытается закрыть попап: сперва крестик, иначе BACK.
+    """
+    img = adb.screencap_cv()
+    if img is None:
+        adb.key_back()
+        time.sleep(0.12)
+        return
+
+    hit = find_one(img, Cfg.TPL_CLOSE_CROSS, Cfg.THRESH_NORMAL)
+    if hit:
+        adb.tap(*hit["center"])
+        time.sleep(0.15)
+        return
+
+    adb.key_back()
+    time.sleep(0.15)
+
+
+# ---------- Пример сценария ----------
+
+def run_once_on_index(adb: ADB, index: int) -> bool:
+    """
+    1) Открыть попап предмета по индексу в сетке.
+    2) Попробовать подобрать.
+    3) Закрыть попап.
+    """
+    if not open_item_popup_by_index(adb, index):
+        print(f"[RUN] Не удалось открыть попап для index={index}")
+        return False
+
+    picked = pickup_current_if_possible(adb)
+    close_popup(adb)
+    return picked
+
+
+def main():
+    # Если несколько устройств — укажи serial: ADB(serial="192.168.1.23:5555")
+    adb = ADB()
+
+    # Быстрая валидация подключения
+    w, h = adb.get_size()
+    print(f"[ADB] Screen: {w}x{h}")
+    if w == 0 or h == 0:
+        print("[ADB] Не вижу экран. Проверь adb connect и разрешения.")
+        return
+
+    # Убедись, что шаблоны лежат в ./assets/*.png
+    # Минимум: items_label, pickup_active, pickup_inactive.
+    ensure_dir(Cfg.DEBUG_DIR)
+
+    # Пример: пройтись по первым 6 ячейкам
+    for idx in range(6):
+        ok = run_once_on_index(adb, idx)
+        print(f"[RUN] index={idx}, picked={ok}")
+        time.sleep(0.25)
+
+
+if __name__ == "__main__":
+    main()

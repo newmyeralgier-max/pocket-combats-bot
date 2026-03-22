@@ -1,0 +1,539 @@
+# -*- coding: utf-8 -*-
+"""
+pic_tpl.py — извлечение ровно ОДНОЙ цельной иконки предмета из loot-скрина.
+
+Ключевое:
+- Детект имени по шаблонам из C:\bot\tpl\templates.
+- Иконка слева от названия; адаптивный бокс по нефоновым (не‑белым) пикселям.
+- Расширение до минимальной "белой рамки" с 4 сторон (по порогу).
+- Ровно одна иконка (max_icons=1), выбор цели — лучший по score или target_base_name.
+- Антидубли: md5 по PNG.
+- Визы и логи: C:\bot\debug\pictures\log_pictures и C:\bot\debug\log\log.txt
+"""
+
+import os
+import re
+import sys
+import time
+import hashlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+# =========================
+#      Константы/пути
+# =========================
+BOT_ROOT = Path(r"C:\bot")
+TPL_DIR = BOT_ROOT / "tpl" / "templates"
+SCREENS_DIR = BOT_ROOT / "back" / "screens"
+LOG_FILE = BOT_ROOT / "debug" / "log" / "log.txt"
+DBG_DIR = BOT_ROOT / "debug" / "pictures" / "log_pictures"
+
+# Детект названий (шаблоны-имена)
+ITEM_SCALES: List[float] = [0.90, 0.95, 1.00, 1.05]
+ITEM_NAME_THRESHOLD: float = 0.83
+SUPPRESS_Y: int = 35
+MAX_HITS_PER_TPL: int = 8
+SCHARR_FALLBACK_DELTA: float = 0.03
+
+# Геометрия поискового окна слева от текста
+SEARCH_LEFT_MAX_PX = 300       # максимум влево от начала текста
+SEARCH_VPAD_PX = 12            # вертикальный запас относительно высоты текста
+
+# Белый фон (HSV)
+WHITE_S_MAX = 35               # чем меньше S, тем "белее"
+WHITE_V_MIN = 220              # высокая яркость
+WHITE_BORDER_MIN_RATIO = 0.88  # доля белых пикселей на рамке при расширении
+
+# Фильтры компоненты иконки
+MIN_ICON_AREA = 32 * 32        # шум ниже — отбрасываем
+AR_MIN, AR_MAX = 0.6, 1.6      # разумное отношение сторон для иконки
+
+# Сколько иконок сохраняем за проход (по умолчанию — РОВНО ОДНУ)
+DEFAULT_MAX_ICONS = 1
+
+
+# =========================
+#      Данные/типы
+# =========================
+@dataclass
+class DetectedItem:
+    base_name: str                   # базовое имя (без хвостового _N)
+    name_box: Tuple[int, int, int, int]  # (x, y, w, h) в исходном изображении
+    tpl_file: str                    # от какого шаблона
+    score: float
+
+
+# =========================
+#         Утилиты
+# =========================
+def _now_stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _append_log(msg: str) -> None:
+    _ensure_dir(LOG_FILE.parent)
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{_now_stamp()} | {msg}\n")
+
+
+def _to_gray(img: np.ndarray) -> np.ndarray:
+    g = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    g = cv2.bilateralFilter(g, 5, 35, 35)
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+
+
+def _scharr_mag(gray: np.ndarray) -> np.ndarray:
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    return cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def _match_multi_scaled(gray_img: np.ndarray, tpl_gray_full: np.ndarray, threshold: float, suppress_y: int, max_hits: int) -> List[Tuple[int, int, int, int, float]]:
+    H, W = gray_img.shape[:2]
+    out: List[Tuple[int, int, int, int, float]] = []
+    th, tw = tpl_gray_full.shape[:2]
+    for s in ITEM_SCALES:
+        tws, ths = max(5, int(tw * s)), max(5, int(th * s))
+        if H < ths or W < tws:
+            continue
+        tpl_gray = cv2.resize(tpl_gray_full, (tws, ths), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(gray_img, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        RH, RW = res.shape[:2]
+        hits = 0
+        sy = max(8, int(suppress_y))
+        sx = max(0, int(tws // 4))
+        while hits < max_hits:
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            if float(max_val) < float(threshold):
+                break
+            x, y = int(max_loc[0]), int(max_loc[1])
+            out.append((x, y, tws, ths, float(max_val)))
+            y1 = max(0, y - sy)
+            y2 = min(RH - 1, y + sy)
+            x1 = max(0, x - sx)
+            x2 = min(RW - 1, x + sx)
+            res[y1:y2 + 1, :] = 0
+            if sx > 0:
+                res[:, x1:x2 + 1] = 0
+            hits += 1
+    out.sort(key=lambda r: (r[1], -r[4]))
+    merged: List[Tuple[int, int, int, int, float]] = []
+    for bx, by, bw, bh, sc in out:
+        if not merged:
+            merged.append((bx, by, bw, bh, sc)); continue
+        _, last_y, _, last_h, last_sc = merged[-1]
+        if abs((by + bh // 2) - (last_y + last_h // 2)) <= max(10, suppress_y // 2):
+            if sc > last_sc:
+                merged[-1] = (bx, by, bw, bh, sc)
+        else:
+            merged.append((bx, by, bw, bh, sc))
+    return merged
+
+
+def _load_png_unicode(path: Path) -> Optional[np.ndarray]:
+    arr = np.fromfile(str(path), dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def _save_png_unicode(path: Path, img: np.ndarray) -> None:
+    _ensure_dir(path.parent)
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError(f"Failed to encode png: {path}")
+    buf.tofile(str(path))
+
+
+def _stem(path: Path) -> str:
+    return path.stem
+
+
+def _strip_tail_num(name_stem: str) -> str:
+    return re.sub(r"_(\d+)$", "", name_stem)
+
+
+def _unique_target_path(save_dir: Path, base_stem: str) -> Path:
+    existing = list(save_dir.glob(f"{base_stem}*.png"))
+    if not existing:
+        return save_dir / f"{base_stem}_1.png"
+    max_idx = 0
+    for p in existing:
+        m = re.match(rf"^{re.escape(base_stem)}_(\d+)$", p.stem)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+        elif p.stem == base_stem:
+            max_idx = max(max_idx, 0)
+    return save_dir / f"{base_stem}_{max_idx + 1}.png"
+
+
+def _md5_of_png(img_bgr: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        return ""
+    return hashlib.md5(buf.tobytes()).hexdigest()
+
+
+def _load_item_name_templates() -> List[Tuple[str, np.ndarray]]:
+    skip_exact = {
+        "monsters_tab.png", "items_tab.png", "open_tab.png", "close_tab.png",
+        "pickup.png", "pickup_own.png", "pickup_other.png", "syschat.png",
+        "start.png", "items_hdr.png", "items_header.png", "fights_tab.png",
+        "continue.png", "close_1.png", "close_2.png", "victory.png",
+        "monster_params.png", "monster_hp.png", "moves.png",
+        "preffered_skill.png", "preffered_skill_text.png",
+        "players_tab.png", "popup_auto.png",
+    }
+    tpls: List[Tuple[str, np.ndarray]] = []
+    for p in sorted(TPL_DIR.glob("*.png")):
+        base = p.name
+        low = base.lower()
+        if base in skip_exact:
+            continue
+        if any(s in low for s in ("tab", "chevron", "hdr", "label", "popup")):
+            continue
+        img = _load_png_unicode(p)
+        if img is None:
+            _append_log(f"[TPL] not readable: {p}")
+            continue
+        tpls.append((base, img))
+    _append_log(f"[TPL] loaded name-templates: {len(tpls)}")
+    return tpls
+
+
+def _detect_name_boxes_by_templates(image_bgr: np.ndarray) -> List[DetectedItem]:
+    if image_bgr is None:
+        return []
+    gray = _to_gray(image_bgr)
+    tpls = _load_item_name_templates()
+    hits: List[DetectedItem] = []
+
+    for tpl_name, tpl_img in tpls:
+        ok_list = _match_multi_scaled(gray, _to_gray(tpl_img), ITEM_NAME_THRESHOLD, SUPPRESS_Y, MAX_HITS_PER_TPL)
+        for x, y, w, h, sc in ok_list:
+            hits.append(DetectedItem(
+                base_name=_strip_tail_num(_stem(Path(tpl_name))),
+                name_box=(x, y, w, h),
+                tpl_file=tpl_name,
+                score=float(sc),
+            ))
+
+    if not hits:
+        gg = _scharr_mag(gray)
+        for tpl_name, tpl_img in tpls:
+            tg = _scharr_mag(_to_gray(tpl_img))
+            thr = max(0.80, ITEM_NAME_THRESHOLD - SCHARR_FALLBACK_DELTA)
+            ok_list = _match_multi_scaled(gg, tg, thr, SUPPRESS_Y, MAX_HITS_PER_TPL)
+            for x, y, w, h, sc in ok_list:
+                hits.append(DetectedItem(
+                    base_name=_strip_tail_num(_stem(Path(tpl_name))),
+                    name_box=(x, y, w, h),
+                    tpl_file=tpl_name,
+                    score=float(sc),
+                ))
+
+    # дедуп по (base,y_group)
+    dedup: Dict[Tuple[str, int], DetectedItem] = {}
+    for it in hits:
+        _, y, _, _ = it.name_box
+        y_group = int(round(y / float(max(10, SUPPRESS_Y))))
+        key = (it.base_name, y_group)
+        if key not in dedup or it.score > dedup[key].score:
+            dedup[key] = it
+    return [dedup[k] for k in sorted(dedup.keys(), key=lambda k: k[1])]
+
+
+# =========================
+#   Сегментация иконки по белому фону
+# =========================
+def _hsv_white_mask(bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    white = (s <= WHITE_S_MAX) & (v >= WHITE_V_MIN)
+    return white.astype(np.uint8)  # 0/1
+
+
+def _nonwhite_mask(bgr: np.ndarray) -> np.ndarray:
+    white = _hsv_white_mask(bgr)
+    return (1 - white).astype(np.uint8)
+
+
+def _connected_components_bbox(mask_u8: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
+    # mask_u8: 0/1
+    mask = (mask_u8 * 255).astype(np.uint8)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    out: List[Tuple[int, int, int, int, int]] = []
+    for i in range(1, num):  # 0 — фон
+        x, y, w, h, area = stats[i]
+        out.append((x, y, w, h, int(area)))
+    return out
+
+
+def _select_icon_blob(cands: List[Tuple[int, int, int, int, int]], prefer_right_edge: int) -> Optional[Tuple[int, int, int, int]]:
+    # Предпочитаем крупную, "почти квадратную" и близкую к правому краю ROI (рядом с текстом)
+    if not cands:
+        return None
+    scored = []
+    for x, y, w, h, area in cands:
+        if area < MIN_ICON_AREA:
+            continue
+        ar = w / max(1, h)
+        ar_penalty = 0.0 if AR_MIN <= ar <= AR_MAX else 0.5
+        right_dist = abs((x + w) - prefer_right_edge)
+        score = area - 200 * ar_penalty - 2.0 * right_dist
+        scored.append((score, (x, y, w, h)))
+    if not scored:
+        # хотя бы крупнейшая область
+        biggest = max(cands, key=lambda t: t[4])
+        return biggest[:4]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored[0][1]
+
+
+def _expand_to_white_frame(roi_bgr: np.ndarray, box_xywh: Tuple[int, int, int, int], max_expand: int = 30) -> Tuple[int, int, int, int]:
+    # Расширяем бокс, пока на границах преобладает белый
+    H, W = roi_bgr.shape[:2]
+    x, y, w, h = box_xywh
+    white = _hsv_white_mask(roi_bgr)
+
+    def border_white_ratio(xx, yy, ww, hh):
+        # верх/низ/лево/право — средняя доля белого на 1-пиксельной рамке
+        ratios = []
+        if yy > 0:
+            top = white[max(0, yy - 1):yy, xx:xx + ww]
+            if top.size: ratios.append(top.mean())
+        if yy + hh < H:
+            bottom = white[yy + hh: min(H, yy + hh + 1), xx:xx + ww]
+            if bottom.size: ratios.append(bottom.mean())
+        if xx > 0:
+            left = white[yy:yy + hh, max(0, xx - 1):xx]
+            if left.size: ratios.append(left.mean())
+        if xx + ww < W:
+            right = white[yy:yy + hh, xx + ww: min(W, xx + ww + 1)]
+            if right.size: ratios.append(right.mean())
+        return sum(ratios) / max(1, len(ratios))
+
+    # Пробуем расширять синхронно
+    step = 1
+    exp = 0
+    best = (x, y, w, h)
+    while exp < max_expand:
+        xx = max(0, x - step)
+        yy = max(0, y - step)
+        ww = min(W, x + w + step) - xx
+        hh = min(H, y + h + step) - yy
+        ratio = border_white_ratio(xx, yy, ww, hh)
+        if ratio >= WHITE_BORDER_MIN_RATIO:
+            best = (xx, yy, ww, hh)
+            x, y, w, h = xx, yy, ww, hh
+            exp += step
+        else:
+            break
+    return best
+
+
+def _adaptive_icon_crop(full_bgr: np.ndarray, name_box: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    H, W = full_bgr.shape[:2]
+    x, y, w, h = name_box
+    # ROI слева от текста
+    rx2 = x
+    rx1 = max(0, rx2 - SEARCH_LEFT_MAX_PX)
+    ry1 = max(0, y - SEARCH_VPAD_PX)
+    ry2 = min(H, y + h + SEARCH_VPAD_PX)
+    if rx2 <= rx1 or ry2 <= ry1:
+        return None
+
+    roi = full_bgr[ry1:ry2, rx1:rx2]
+    nonwhite = _nonwhite_mask(roi)
+
+    # лёгкая морфология: закрытие мелких дыр
+    kernel = np.ones((3, 3), np.uint8)
+    nonwhite = cv2.morphologyEx(nonwhite, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    cands = _connected_components_bbox(nonwhite)
+    if not cands:
+        # fallback: edges
+        edges = cv2.Canny(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), 60, 150)
+        ys, xs = np.where(edges > 0)
+        if ys.size and xs.size:
+            x1, x2 = xs.min(), xs.max()
+            y1, y2 = ys.min(), ys.max()
+            cand = (x1, y1, x2 - x1 + 1, y2 - y1 + 1)
+        else:
+            return None
+    else:
+        # Предпочитаем компоненту, примыкающую справа к тексту
+        cand = _select_icon_blob(cands, prefer_right_edge=roi.shape[1])
+
+    if cand is None:
+        return None
+
+    cx, cy, cw, ch = cand
+    # Расширение до белой рамки
+    ex, ey, ew, eh = _expand_to_white_frame(roi, (cx, cy, cw, ch), max_expand=40)
+
+    # Переводим в координаты исходного изображения
+    gx1, gy1 = rx1 + ex, ry1 + ey
+    return gx1, gy1, ew, eh
+
+
+# =========================
+#     Основная функция
+# =========================
+def extract_icons_from_loot_screens(
+    root_dir: str = str(SCREENS_DIR),
+    save_dir: str = str(TPL_DIR),
+    log_file: str = str(LOG_FILE),
+    debug_dir: str = str(DBG_DIR),
+    target_base_name: Optional[str] = None,   # если задан — вырежем именно для этого имени (если найдено)
+    alias_map: Optional[Dict[str, str]] = None,
+    preprocess_hook: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    dry_run: bool = False,
+    max_icons: int = DEFAULT_MAX_ICONS,       # по умолчанию — 1
+) -> Dict[str, int]:
+
+    out_dir = Path(save_dir)
+    dbg_dir = Path(debug_dir)
+    _ensure_dir(out_dir)
+    _ensure_dir(dbg_dir)
+
+    global LOG_FILE
+    LOG_FILE = Path(log_file)
+
+    # Ищем loot-скрины
+    root = Path(root_dir)
+    loot_images = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"} and "loot" in p.name.lower()
+    ]
+    loot_images.sort()
+    _append_log(f"found loot images: {len(loot_images)}")
+    for p in loot_images:
+        _append_log(f"found: {p}")
+
+    stats = {"processed_images": 0, "saved_icons": 0, "skipped_duplicates": 0}
+
+    if not loot_images:
+        print("No loot images found in:", root)
+        return stats
+
+    total_saved = 0
+
+    for img_path in loot_images:
+        if total_saved >= max_icons:
+            break
+        try:
+            arr = np.fromfile(str(img_path), dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                _append_log(f"error | cannot read {img_path}")
+                continue
+
+            # 1) Детект названий
+            items = _detect_name_boxes_by_templates(img)
+            if not items:
+                _append_log(f"no items | {img_path.name}")
+                stats["processed_images"] += 1
+                continue
+
+            # 2) Выбор целевой строки
+            if target_base_name:
+                # ищем точное совпадение (с учётом alias)
+                tbn = alias_map.get(target_base_name, target_base_name) if alias_map else target_base_name
+                candidates = [it for it in items if _strip_tail_num(it.base_name) == _strip_tail_num(tbn)]
+                chosen = max(candidates, key=lambda it: it.score) if candidates else None
+                if chosen is None:
+                    _append_log(f"target '{tbn}' not found on {img_path.name}; skipping")
+                    stats["processed_images"] += 1
+                    continue
+            else:
+                # берём самый уверенный hit (макс score)
+                chosen = max(items, key=lambda it: it.score)
+
+            # 3) Адаптивный вырез иконки
+            icon_box = _adaptive_icon_crop(img, chosen.name_box)
+            if icon_box is None:
+                _append_log(f"icon_not_found | {img_path.name} | base='{chosen.base_name}' | name_box={chosen.name_box}")
+                stats["processed_images"] += 1
+                continue
+
+            gx1, gy1, gw, gh = icon_box
+            icon = img[gy1:gy1 + gh, gx1:gx1 + gw]
+            if icon.size == 0:
+                _append_log(f"empty_crop | {img_path.name} | base='{chosen.base_name}' | icon_box={icon_box}")
+                stats["processed_images"] += 1
+                continue
+
+            # 4) Антидубли по md5, авто-имя и сохранение
+            base_stem = alias_map.get(chosen.base_name, chosen.base_name) if alias_map else chosen.base_name
+            # Соберём хэши существующих этой базы
+            hashes: Dict[str, Path] = {}
+            for p in out_dir.glob(f"{base_stem}*.png"):
+                ex_img = _load_png_unicode(p)
+                if ex_img is None:
+                    continue
+                h = _md5_of_png(ex_img)
+                if h:
+                    hashes[h] = p
+
+            new_hash = _md5_of_png(icon)
+            if new_hash and new_hash in hashes:
+                stats["skipped_duplicates"] += 1
+                _append_log(f"dup-skip | {img_path.name} | base='{base_stem}' equals {hashes[new_hash].name}")
+                stats["processed_images"] += 1
+                continue
+
+            target_path = _unique_target_path(out_dir, base_stem)
+            icon_to_save = icon if preprocess_hook is None else (preprocess_hook(icon) or icon)
+
+            if not dry_run:
+                _save_png_unicode(target_path, icon_to_save)
+                stats["saved_icons"] += 1
+                total_saved += 1
+
+            # 5) Визуализация
+            vis = img.copy()
+            x, y, w, h = chosen.name_box
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 180, 255), 2)  # name box
+            cv2.rectangle(vis, (gx1, gy1), (gx1 + gw, gy1 + gh), (0, 255, 0), 2)  # icon box
+            cv2.putText(vis, f"{base_stem} ({chosen.score:.2f})", (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 0), 1, cv2.LINE_AA)
+            _save_png_unicode(dbg_dir / f"{_now_stamp()}__{img_path.stem}_vis.png", vis)
+
+            _append_log(
+                f"saved | src={img_path.name} | tpl='{chosen.tpl_file}' | base='{base_stem}' -> {target_path.name} "
+                f"| score={chosen.score:.3f} | size={icon_to_save.shape[1]}x{icon_to_save.shape[0]} | name_box={chosen.name_box} | icon_box={(gx1, gy1, gw, gh)}"
+            )
+
+            stats["processed_images"] += 1
+        except Exception as e:
+            _append_log(f"error | {img_path} | {e!r}")
+
+    _append_log(f"done | processed={stats['processed_images']} | saved={stats['saved_icons']} | dup_skipped={stats['skipped_duplicates']}")
+    return stats
+
+
+# =========================
+#        Запуск
+# =========================
+if __name__ == "__main__":
+    res = extract_icons_from_loot_screens(
+        root_dir=str(SCREENS_DIR),
+        save_dir=str(TPL_DIR),
+        log_file=str(LOG_FILE),
+        debug_dir=str(DBG_DIR),
+        target_base_name=None,   # можно указать конкретное имя (напр. 'янтарь'), тогда режем именно его
+        alias_map=None,          # {'янтарь_1':'янтарь'} — если нужно сводить варианты
+        preprocess_hook=None,    # опциональная нормализация иконки
+        dry_run=False,
+        max_icons=1,             # РОВНО ОДНА иконка за запуск
+    )
+    print(res)

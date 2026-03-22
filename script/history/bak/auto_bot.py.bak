@@ -1,0 +1,1768 @@
+
+
+import datetime
+import glob
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import cv2
+import numpy
+import numpy as np
+
+
+def safe_match_template(roi, tpl, method=cv2.TM_CCOEFF_NORMED, name: str = ""):
+
+    """
+    Безопасный wrapper для cv2.matchTemplate — проверяет формы и ловит исключения.
+    Возвращает результат matchTemplate или None.
+    """
+    try:
+        if roi is None or tpl is None:
+            return None
+        # защита от tpl больше ROI
+        if roi.shape[0] < tpl.shape[0] or roi.shape[1] < tpl.shape[1]:
+            return None
+        return cv2.matchTemplate(roi, tpl, method)
+    except Exception:
+        return None
+
+
+# --- ADD: unified tpl resolver ---
+# попытка использовать внешнюю реализацию resolver'а, если она есть в tpl_loader
+try:
+    _TPL_LOADER = sys.modules.get("tpl_loader")
+    _TPL_UI_RESOLVER = getattr(_TPL_LOADER, "ui_tpl_path", None) if _TPL_LOADER else None
+except Exception:
+    _TPL_UI_RESOLVER = None
+
+
+
+# ensure local repo root is on sys.path early so package imports below work
+sys.path.append(os.path.join('C:/bot'))
+
+    from tab_detector import detect_tab_states
+    from script.loot.auto_bot import device_swipe
+
+from matcher import TPL_CACHE, find_all_matches, preprocess_gray
+from tpl_loader import (
+    CFG,
+    get_item_score,
+    load_item_name_templates_unified,
+)
+
+from script.loot.quick_tap import quick_tap_for_label
+from script.loot.utils import short_time_tag
+
+# local helpers from script package (now safe to import because sys.path was adjusted)
+
+
+def ui_tpl_path(name: str) -> str:
+    """
+    Возвращает путь к шаблону по имени. Сначала пытается вызвать tpl_loader.ui_tpl_path,
+    затем проверяет несколько локальных fallback-путей.
+    """
+    if _TPL_UI_RESOLVER:
+        try:
+            return _TPL_UI_RESOLVER(name)
+        except Exception:
+            # fallthrough to fallback resolver
+            pass
+
+    # локальные fallback-пути (те, что обычно используются в проекте)
+    candidates = [
+        os.path.join("C:/bot", "tpl", "служебные", f"{name}.png"),
+        os.path.join("C:/bot", "tpl", f"{name}.png"),
+        os.path.join("C:/bot", "tpl", "имя_предметов", f"{name}.png"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # вернуть первое предполагаемое (несуществующее) чтобы исходный код мог логировать путь
+    return candidates[0]
+
+
+# ALLOWED_LOOT_DIRS из конфига
+ALLOWED_LOOT_DIRS = list(
+    CFG.get(
+        "ALLOWED_LOOT_DIRS",
+        [
+            r"C:\bot\tpl\имя_предметов",
+            r"C:\bot\tpl\имя_рун",
+            r"C:\bot\tpl\иконки_рун",
+            r"C:\bot\tpl\иконки_предметов",
+        ],
+    )
+)
+
+
+def loot_only_files(file_list: List[str]) -> List[str]:
+    """
+    Фильтрует переданный список файлов, оставляя только те, что находятся в ALLOWED_LOOT_DIRS.
+    """
+    if not file_list:
+        return []
+    out: List[str] = []
+    for f in file_list:
+        # нормализуем путь для сравнения
+        nf = os.path.normpath(f)
+BASE_DIR = 'C:/bot'
+SCRIPT_DIR = os.path.join(BASE_DIR, 'script')
+SCREENS_DIR = os.path.join(BASE_DIR, 'back', 'screens')
+OUT_DIR = os.path.join(BASE_DIR, 'debug', 'out')
+DEBUG_DIR = os.path.join(BASE_DIR, 'debug', 'pictures', 'log_pictures')
+TPL_DIR_MY = os.path.join(BASE_DIR, 'tpl', 'имя_предметов')
+TPL_CHEVRONS_DIR = os.path.join(BASE_DIR, 'tpl', 'служебные')
+LOG_DIR = os.path.join(BASE_DIR, 'htxt')
+CFG_DIR = os.path.join(BASE_DIR, 'tools', 'cfg')
+CFG_FILE = os.path.join(CFG_DIR, 'config.json')
+LOG_FILE = os.path.join(LOG_DIR, 'log.txt')
+for d in (SCREENS_DIR, OUT_DIR, DEBUG_DIR, LOG_DIR, CFG_DIR):
+    os.makedirs(d, exist_ok=True)
+TPL_CHEVRONS_DIR = os.path.join(BASE_DIR, 'tpl', 'служебные')
+LOG_DIR = os.path.join(BASE_DIR, 'htxt')
+CFG_DIR = os.path.join(BASE_DIR, 'tools', 'cfg')
+CFG_FILE = os.path.join(CFG_DIR, 'config.json')
+LOG_FILE = os.path.join(LOG_DIR, 'log.txt')
+for d in (SCREENS_DIR, OUT_DIR, DEBUG_DIR, LOG_DIR, CFG_DIR):
+    os.makedirs(d, exist_ok=True)
+STEP_COUNTER = 0
+FIND_CFG = CFG.get('FIND', {})
+FIND_THRESHOLD = float(FIND_CFG.get('THRESHOLD', CFG.get('item_name_threshold', 0.86)))
+FIND_SCALES = list(FIND_CFG.get('ITEM_SCALES', CFG.get('item_scales', [0.95, 1.0, 1.05])))
+PREPROC_MODE = str(FIND_CFG.get('PREPROC_MODE', "gray"))
+MIN_DY = int(FIND_CFG.get('MIN_DY', 10))
+SUPPRESS_Y = int(FIND_CFG.get('SUPPRESS_Y', CFG.get('item_group_threshold', 50)))
+IGNORE_WHITELIST = bool(FIND_CFG.get('IGNORE_WHITELIST', False))
+IGNORE_SKIP_SUBSTR = bool(FIND_CFG.get('IGNORE_SKIP_SUBSTR', False))
+FORCE_FS_SCAN = bool(FIND_CFG.get('FORCE_FS_SCAN', False))
+ONLY_NAME_MASK = bool(FIND_CFG.get('ONLY_NAME_MASK', True))
+USE_LEGACY_FINDER = bool(CFG.get('LOGIC', {}).get('USE_LEGACY_FINDER', False))
+SERVICE_SKIP = {
+    'monsters_tab.png','items_tab.png','open_tab.png','close_tab.png',
+    'pickup.png','pickup_own.png','pickup_other.png','syschat.png',
+    'start.png','start.PNG','items_hdr.png','items_label.png'
+}
+
+def _is_service_file(base: str) -> bool:
+    if base in SERVICE_SKIP:
+        return True
+    low = base.lower()
+    if ONLY_NAME_MASK and not low.endswith('_name.png'):
+        return True
+    if not IGNORE_SKIP_SUBSTR:
+        for sub in SKIP_SUBSTR:
+            if sub and sub in low:
+                return True
+    return False
+
+def get_item_name_templates(detect_only_names: Optional[Set[str]] = None) -> List[Tuple[str, np.ndarray, str]]:
+    """
+    Возвращает список (base_name, img_bgr, path). Логирует причины отбраковки.
+    detect_only_names: опциональный динамический фильтр по именам шаблонов (basename файлов).
+    """
+    accepted, skipped = [], []
+
+    # 1) попытка через реестр/loader
+    try:
+        # Базовая логика: если активен глобальный DETECT_ONLY_WHITELIST и не игнорим whitelist — ограничиваем ALLOWED_ITEM_NAMES
+        base_detect_wl = None if IGNORE_WHITELIST else (list(ALLOWED_ITEM_NAMES) if DETECT_ONLY_WHITELIST else None)
+        # Динамический фильтр имеет приоритет, если передан
+        effective_detect = list(detect_only_names) if detect_only_names else base_detect_wl
+
+        if not FORCE_FS_SCAN:
+            tpls = load_item_name_templates_unified(
+                should_skip=lambda base: _is_service_file(base),
+                detect_whitelist=effective_detect,
+                allowed_dirs=ALLOWED_LOOT_DIRS
+            )
+        else:
+            tpls = []
+    except Exception as e:
+        structured_log('tpls_loader_error', error=str(e))
+        tpls = []
+
+    # 2) фолбэк: FS-скан
+    if not tpls:
+        files = []
+        for d in ALLOWED_LOOT_DIRS:
+            for ext in ('*.png', '*.PNG'):
+                files.extend(glob.glob(os.path.join(d, ext)))
+        files = sorted(set(p.replace('\\', '/') for p in files))
+        for p in files:
+            base = os.path.basename(p)
+            if _is_service_file(base):
+                skipped.append({'file': base, 'reason': 'service_or_mask'})
+                continue
+            # Если активен динамический фильтр — жёстко отбрасываем всё вне него
+            if detect_only_names and base not in detect_only_names:
+                skipped.append({'file': base, 'reason': 'not_in_dynamic_filter'})
+                continue
+            img = imread_u8(p, cv2.IMREAD_COLOR)
+            if img is None:
+                skipped.append({'file': base, 'reason': 'load_fail'})
+                continue
+            accepted.append((base, img, p))
+    else:
+        # унифицируем: добавляем путь как None (кэш не будет по пути, но это ок)
+        for base, img in tpls:
+            if _is_service_file(base):
+                skipped.append({'file': base, 'reason': 'service_or_mask'})
+                continue
+            # Доп. защита: если dynamic фильтр задан, отбрасываем лишнее
+            if detect_only_names and base not in detect_only_names:
+                skipped.append({'file': base, 'reason': 'not_in_dynamic_filter'})
+                continue
+            accepted.append((base, img, None))
+
+    structured_log(
+        'items_tpls_summary',
+        total=len(accepted)+len(skipped),
+        accepted=len(accepted),
+        skipped=len(skipped),
+        skipped_sample=skipped[:10],
+        dynamic_filter_active=bool(detect_only_names),
+        dynamic_filter_size=(len(detect_only_names) if detect_only_names else 0)
+    )
+    return accepted
+
+def next_step(label: str):
+
+    global STEP_COUNTER
+    STEP_COUNTER += 1
+    return f'step_{STEP_COUNTER:04d}_{label}'
+
+
+def mark_step(label: str) ->int:
+    """
+    Явно поднимает шаг и возвращает step_id (int).
+    Используй перед большим действием чтобы связать логи и снапы.
+    """
+    global STEP_COUNTER
+    STEP_COUNTER += 1
+    structured_log('step_mark', step_id=STEP_COUNTER, label=label)
+    return STEP_COUNTER
+
+
+DEFAULT_CFG: Dict[str, Any] = {'use_slot_grouping': True, 'device_id': None,
+    'dry_run': False, 'DEBUG': True, 'save_debug_images': True,
+    'sleep_after_tap': 0.65, 'step_delay': 0.35, 'delay_between_loops': 5.0,
+    'max_loot_rounds': 0, 'max_tab_attempts': 2, 'item_name_threshold': 
+    0.86, 'item_scales': [0.95, 1.0, 1.05], 'max_lines_to_collect': 12,
+    'item_group_step': 150, 'item_group_threshold': 50, 'pickup_rel': [0.72,
+    0.83, 0.95, 0.94], 'color_ratio_threshold': 0.12, 'safe_x1': 0,
+    'safe_x2': 1080, 'safe_y1': 400, 'safe_y2': 2100,
+    'max_screenshot_attempts': 2, 'pickup_timeout_sec': 6.0,
+    'chevron_threshold': 0.86, 'label_threshold': 0.86,
+    'label_threshold_fallback': 0.83}
+
+
+def now_ts():
+
+    return short_time_tag(include_seconds=True)
+
+
+def jitter_inside_box(center_x, center_y, w, h, pct=0.15):
+
+    """Случайная точка внутри эллипса в пределах pct*размера шаблона."""
+    rx = w // 2 * pct
+    ry = h // 2 * pct
+    for _ in range(10):
+        angle = random.uniform(0, 2 * math.pi)
+        r = random.random()
+        dx = int(math.cos(angle) * rx * r)
+        dy = int(math.sin(angle) * ry * r)
+        x = center_x + dx
+        y = center_y + dy
+        if 0 <= x <= SAFE_X2 and 0 <= y <= SAFE_Y2:
+            return x, y
+    return center_x, center_y
+
+
+def jitter_time(base_sec, pct=0.15):
+
+    """Разброс времени ±pct."""
+    return base_sec * (1 + random.uniform(-pct, pct))
+
+
+def log(msg: str):
+
+    line = f'[{now_ts()}] {msg}'
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except Exception:
+        pass
+
+
+def load_config() ->Dict[str, Any]:
+    cfg = DEFAULT_CFG.copy()
+    if os.path.isfile(CFG_FILE):
+        try:
+            with open(CFG_FILE, 'r', encoding='utf-8') as f:
+                user = json.load(f)
+            for k, v in user.items():
+                cfg[k] = v
+            log('[CFG] Загружен tools/tools/tools/tools/tools/tools/tools/cfg/config.json'
+                )
+        except Exception as e:
+            log(f'[CFG] Не удалось прочитать config.json: {e} — используем дефолт'
+                )
+    else:
+        try:
+            with open(CFG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_CFG, f, ensure_ascii=False, indent=2)
+            log('[CFG] Сохранён дефолтный config.json (можно править ROI/тайминги)'
+                )
+        except Exception as e:
+            log(f'[CFG] Не удалось сохранить дефолтный config.json: {e}')
+    return cfg
+
+
+CFG = load_config()
+FIND = CFG.get('FIND', {})
+DETECT_ONLY_WHITELIST = bool(FIND.get('DETECT_ONLY_WHITELIST', False))
+SKIP_SUBSTR = list(FIND.get('SKIP_SUBSTR', ['tab', 'chevron', 'hdr', 'label']))
+EXCLUDE_ZONES = list(FIND.get('EXCLUDE_ZONES', [[0, 1900, 500, 2100]]))
+QT = CFG.get('QUICK_TAP', {})
+QT_X1 = int(QT.get('X1', 910))
+QT_X2 = int(QT.get('X2', 1000))
+QT_Y_OFFSET = int(QT.get('Y_OFFSET', -15))
+QT_JITTER_PCT = float(QT.get('JITTER_PCT', 0.15))
+QT_DELAY_BETWEEN = float(QT.get('DELAY_BETWEEN_TAPS_SEC', 0.04))
+QT_POST_SERIES = float(QT.get('POST_SERIES_DELAY_SEC', 0.12))
+DRY_RUN = CFG.get('DRY_RUN', CFG.get('dry_run', False))
+DEBUG = CFG.get('DEBUG', True)
+SAVE_DEBUG_IMAGES = CFG.get('save_debug_images', CFG.get('DEBUG', True))
+SCREEN_W = CFG.get('SCREEN_W', 1080)
+SCREEN_H = CFG.get('SCREEN_H', 2460)
+safe = CFG.get('SAFE_TAP_AREA', {'x1': 0, 'y1': 400, 'x2': 1080, 'y2': 2100})
+SAFE_X1, SAFE_Y1, SAFE_X2, SAFE_Y2 = safe['x1'], safe['y1'], safe['x2'], safe[
+    'y2']
+ITEMS_ROI = CFG.get('ITEMS_ROI', [0, 400, 500, 2100])
+STEP_DELAY = CFG.get('STEP_DELAY', 0.3)
+SLEEP_AFTER_TAP = CFG.get('SLEEP_AFTER_TAP', 0.35)
+DELAY_BETWEEN_LOOPS = float(CFG.get('DELAY_BETWEEN_LOOPS', CFG.get(
+    'delay_between_loops', 5.0)))
+MAX_LOOT_ROUNDS = int(CFG.get('max_loot_rounds', 0))
+MATCH = CFG.get('MATCH', {})
+PICKUP_TPL_THRESHOLD = MATCH.get('PICKUP_TPL_THRESHOLD', 0.86)
+PICKUP_SCALES = MATCH.get('PICKUP_SCALES', [0.9, 0.95, 1.0, 1.05])
+PICKUP_COLOR_SAT_MIN = MATCH.get('PICKUP_COLOR_SAT_MIN', 90)
+PICKUP_COLOR_VAL_MIN = MATCH.get('PICKUP_COLOR_VAL_MIN', 160)
+PICKUP_COLOR_RATIO_THRESHOLD = MATCH.get('PICKUP_COLOR_RATIO_THRESHOLD', 0.12)
+PICKUP_METHOD_WEIGHTS = MATCH.get('PICKUP_METHOD_WEIGHTS', {'templ': 0.6,
+    'edge': 0.25, 'color': 0.15})
+PICKUP_ACTIVE_THRESHOLD = MATCH.get('PICKUP_ACTIVE_THRESHOLD', 0.92)
+PICKUP_INACTIVE_THRESHOLD = MATCH.get('PICKUP_INACTIVE_THRESHOLD', 0.9)
+ITEM_NAME_THRESHOLD = MATCH.get('ITEM_NAME_THRESHOLD', CFG.get(
+    'item_name_threshold', 0.86))
+ROI_CFG = CFG.get('ROI', {})
+PICKUP_REL = ROI_CFG.get('PICKUP_REL', CFG.get('pickup_rel', [0.72, 0.83, 
+    0.95, 0.94]))
+PICKUP_REL_CARD_FALLBACK = ROI_CFG.get('PICKUP_REL_CARD_FALLBACK', [0.56, 
+    0.35, 0.98, 0.96])
+SWP = CFG.get('SWIPE', {})
+MAX_SWIPE_ATTEMPTS = int(CFG.get('max_swipe_attempts', SWP.get(
+    'MAX_SWIPE_ATTEMPTS', 4)))
+SWIPE_VECTORS = SWP.get('VECTORS', [[0, 700], [0, 600], [0, 500], [0, 400]])
+SWIPE_DURATION_MS = SWP.get('DURATION_MS', 300)
+SWIPE_PAUSE_MS = SWP.get('PAUSE_MS', 500)
+SWIPE_STOP_ON_REPEAT_HASH = SWP.get('STOP_ON_REPEAT_HASH', True)
+SWIPE_SAME_HASH_STOP_N = int(SWP.get('SAME_HASH_STOP_N', 2))
+TIMINGS = CFG.get('TIMINGS', {})
+CARD_OPEN_DELAY_MS = int(TIMINGS.get('CARD_OPEN_DELAY_MS', 250))
+POST_SWIPE_DELAY_MS = int(TIMINGS.get('POST_SWIPE_DELAY_MS', 200))
+VERIFY1_MS = int(TIMINGS.get('VERIFY_ITEM_REMOVED_1_MS', 1200))
+VERIFY2_MS = int(TIMINGS.get('VERIFY_ITEM_REMOVED_2_MS', 800))
+ORDER = CFG.get('ORDER', {})
+RESCAN_AFTER_PICKUP = ORDER.get('RESCAN_AFTER_PICKUP', True)
+LOGIC = CFG.get('LOGIC', {})
+ALLOW_PICKUP_OTHER = LOGIC.get('ALLOW_PICKUP_OTHER', False)
+ABORT_ON_FIRST_INACTIVE = LOGIC.get('ABORT_ON_FIRST_INACTIVE', True)
+TPLS = CFG.get('TEMPLATES', {})
+TPL_PICKUP_ACTIVE_LIST = TPLS.get('PICKUP_ACTIVE', [])
+TPL_PICKUP_INACTIVE = TPLS.get('PICKUP_INACTIVE', None)
+ALLOWED_ITEM_NAMES = set(CFG.get('ALLOWED_ITEM_NAMES', []))
+FIND_STABILIZE_FRAMES = int(CFG.get('FIND', {}).get('STABILIZE_FRAMES', 1))
+DEVICE_ID: Optional[str] = CFG.get('device_id')
+MAX_SCREENSHOT_ATTEMPTS = int(CFG.get('MAX_SCREENSHOT_ATTEMPTS', CFG.get(
+    'max_screenshot_attempts', 2)))
+ITEM_SCALES = list(CFG.get('item_scales', [0.95, 1.0, 1.05]))
+slot_lifecycle: Dict[Tuple[int, int], dict] = {}
+# === RUNTIME LOOT TARGETS (последняя победа) ===
+_VICTORY_TARGETS: List[str] = []
+
+def set_victory_targets(targets: List[str]):
+
+    global _VICTORY_TARGETS
+    _VICTORY_TARGETS = list(targets or [])
+    structured_log('victory_targets_set', targets=_VICTORY_TARGETS)
+
+def get_victory_targets() -> List[str]:
+    return list(_VICTORY_TARGETS)
+
+def clear_victory_targets():
+
+    global _VICTORY_TARGETS
+    _VICTORY_TARGETS = []
+    structured_log('victory_targets_cleared')
+
+
+def update_slot_lifecycle(found_items: list, stage: str) ->None:
+    """
+    Обновление паспорта жизни слота.
+    stage: 'detected', 'picked_by_bot', 'taken_by_other'
+    """
+    now_ts_str = datetime.datetime.now().isoformat(timespec='seconds')
+    seen_keys = set()
+    for it in found_items:
+        key = int(it['slot_hash']), int(it['box'][1])
+        seen_keys.add(key)
+        if key not in slot_lifecycle:
+            slot_lifecycle[key] = {'name': it['name'], 'first_seen_ts':
+                now_ts_str, 'last_seen_ts': now_ts_str, 'status': stage}
+        else:
+            slot_lifecycle[key]['last_seen_ts'] = now_ts_str
+            if slot_lifecycle[key]['status'] not in ('picked_by_bot',
+                'taken_by_other'):
+                slot_lifecycle[key]['status'] = stage
+    if stage == 'detected':
+        for key, data in slot_lifecycle.items():
+            if key not in seen_keys and data['status'] not in ('picked_by_bot',
+                'taken_by_other'):
+                data['status'] = 'taken_by_other'
+                data['last_seen_ts'] = now_ts_str
+
+
+def finalize_slot_lifecycle() ->None:
+    """
+    Пишем в лог полный отчёт по всем слотам за бой.
+    """
+    structured_log('slot_lifecycle_report', slots=[{'hash': h, 'y': y, **
+        data} for (h, y), data in slot_lifecycle.items()])
+
+
+def dump_queue(tag: str, items_list: list) ->None:
+    structured_log('items_queue', tag=tag, items=[{'name': it['name'], 'y':
+        int(it['box'][1]), 'hash': int(it['slot_hash'])} for it in items_list])
+
+
+def clamp(v, lo, hi):
+
+    return max(lo, min(hi, v))
+
+
+def compute_items_visible_roi(frame_bgr, tabs) ->Tuple[int, int, int, int]:
+    """
+    ROI без обрезания верхних строк. При любых вкладках возвращаем
+    полный вертикальный диапазон, обрезая только по safe_y1/y2.
+    """
+    H, W = frame_bgr.shape[:2]
+    x1, x2 = 0, 500
+    top_y = max(SAFE_Y1, 400)
+    bottom_y = min(SAFE_Y2, 2100)
+    return x1, top_y, x2, bottom_y
+
+def super_swipe_before_loot():
+
+    choice = random.choice([1, 2, 3])
+    if choice == 1:
+        device_swipe(0, -600, 350)
+    elif choice == 2:
+        for _ in range(2):
+            device_swipe(0, -400, 300)
+    else:
+        for _ in range(3):
+            device_swipe(0, -250, 250)
+
+def rect_from_rel(W: int, H: int, rel: List[float]) ->Tuple[int, int, int, int
+    ]:
+    x1 = int(rel[0] * W)
+    y1 = int(rel[1] * H)
+    x2 = int(rel[2] * W)
+    y2 = int(rel[3] * H)
+    return x1, y1, x2, y2
+
+
+def to_gray(img: np.ndarray) ->np.ndarray:
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    g = cv2.bilateralFilter(g, 5, 35, 35)
+    g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+    return g
+
+
+def _scharr_mag(gray: np.ndarray) ->np.ndarray:
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    return cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def match_scaled(gray_img: np.ndarray, tpl_gray_full: np.ndarray, threshold:
+    float, scales: List[float]) ->Tuple[bool, float, Tuple[int, int, int, int]
+    ]:
+    best_ok = False
+    best_score = 0.0
+    best_box = 0, 0, 0, 0
+    th, tw = tpl_gray_full.shape[:2]
+    H, W = gray_img.shape[:2]
+    for s in scales:
+        tws, ths = max(5, int(tw * s)), max(5, int(th * s))
+        if H < ths or W < tws:
+            continue
+        tpl_gray = cv2.resize(tpl_gray_full, (tws, ths), interpolation=cv2.
+            INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(gray_img, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val > best_score:
+            best_score = float(max_val)
+            best_ok = best_score >= threshold
+            best_box = int(max_loc[0]), int(max_loc[1]), int(tws), int(ths)
+    return best_ok, best_score, best_box
+
+
+def match_multi_scaled(gray_img: np.ndarray, tpl_gray_full: np.ndarray,
+    threshold: float, scales: List[float], suppress_y: int,
+    max_hits_per_scale: int=7, suppress_x: Optional[int]=None) ->List[Tuple
+    [int, int, int, int, float]]:
+    """
+    Возвращает список боксов и скор на одной картe соответствия:
+    - собираем несколько пиков (multi-hit) для каждого указанного масштаба,
+      подавляя окрестность по Y (и чуть по X) после каждого найденного пика.
+    - затем объединяем хиты по всем масштабам.
+    """
+    H, W = gray_img.shape[:2]
+    out: List[Tuple[int, int, int, int, float]] = []
+    for s in scales:
+        th, tw = tpl_gray_full.shape[:2]
+        tws, ths = max(5, int(tw * s)), max(5, int(th * s))
+        if H < ths or W < tws:
+            continue
+        tpl_gray = cv2.resize(tpl_gray_full, (tws, ths), interpolation=cv2.
+            INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(gray_img, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        RH, RW = res.shape[:2]
+        hits = 0
+        sy = max(8, int(suppress_y))
+        sx = max(0, int(suppress_x or tws // 4))
+        while hits < max_hits_per_scale:
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            if float(max_val) < float(threshold):
+                break
+            x, y = int(max_loc[0]), int(max_loc[1])
+            out.append((x, y, tws, ths, float(max_val)))
+            y1 = max(0, y - sy)
+            y2 = min(RH - 1, y + sy)
+            x1 = max(0, x - sx)
+            x2 = min(RW - 1, x + sx)
+            res[y1:y2 + 1, :] = 0
+            if sx > 0:
+                res[:, x1:x2 + 1] = 0
+            hits += 1
+    out.sort(key=lambda r: (r[1], -r[4]))
+    merged: List[Tuple[int, int, int, int, float]] = []
+    for bx, by, bw, bh, sc in out:
+        if not merged:
+            merged.append((bx, by, bw, bh, sc))
+            continue
+        _, last_y, _, last_h, last_sc = merged[-1]
+        if abs(by + bh // 2 - (last_y + last_h // 2)) <= max(10, suppress_y //
+            2):
+            if sc > last_sc:
+                merged[-1] = bx, by, bw, bh, sc
+        else:
+            merged.append((bx, by, bw, bh, sc))
+    return merged
+
+
+def get_whitelist_names() -> list:
+    """
+    Возвращает список basename шаблонов из ALLOWED_ITEM_NAMES.
+    Используется FSM для передачи в victory_drop.
+    """
+    try:
+        return list(ALLOWED_ITEM_NAMES or [])
+    except NameError:
+        return []
+
+def imread_u8(path, flags=cv2.IMREAD_COLOR):
+
+    """
+    Чтение изображения с поддержкой кириллицы в путях.
+    Логирует путь, факт существования и ошибки.
+    """
+    try:
+        print(f"[DEBUG] imread_u8 path={path!r} exists={os.path.exists(path)}")
+        if not os.path.exists(path):
+            print(f"[ERROR] imread_u8 file not found: {path!r}")
+            return None
+        with open(path, 'rb') as f:
+            data = f.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, flags)
+        if img is None:
+            print(f"[ERROR] imread_u8 failed to decode: {path!r}")
+        return img
+    except Exception as e:
+        structured_log('tpl_load_fail', file=path, reason=str(e))
+        return None
+
+
+
+def dbg_name(name, step_id=None):
+
+    if step_id is not None:
+        return f'{step_id:04d}_{name}'
+    return next_step(name) if CFG.get('DEBUG_PACK_BY_STEP', False) else name
+
+
+def dbg_save(name: str, img: np.ndarray, rects: Optional[List[Tuple[int,
+    int, int, int]]]=None, points: Optional[List[Tuple[int, int]]]=None,
+    color=(0, 255, 0)):
+    if not SAVE_DEBUG_IMAGES or img is None:
+        return
+    img2 = img.copy()
+    if rects:
+        for x, y, w, h in rects:
+            cv2.rectangle(img2, (x, y), (x + w, y + h), color, 2)
+    if points:
+        for px, py in points:
+            cv2.circle(img2, (px, py), 8, (0, 0, 255), 2)
+    path = os.path.join(DEBUG_DIR, f"{now_ts()}_{dbg_name('' + name)}.png")
+    cv2.imwrite(path, img2)
+    return path
+
+def snap(label: str, frame: np.ndarray, step_id=None, rects=None,
+    rect_colors=None, points=None, point_colors=None):
+    if not SAVE_DEBUG_IMAGES or frame is None:
+        return
+    try:
+        img = frame.copy()
+        rects = rects or []
+        rect_colors = rect_colors or []
+        points = points or []
+        point_colors = point_colors or []
+        for i, r in enumerate(rects):
+            color = rect_colors[i] if i < len(rect_colors) else (0, 255, 0)
+            x, y, w, h = r
+            cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+        for i, p in enumerate(points):
+            color = point_colors[i] if i < len(point_colors) else (0, 0, 255)
+            cv2.circle(img, (int(p[0]), int(p[1])), 8, color, 2)
+        name = f'annot_{dbg_name(label, step_id)}_{now_ts()}.png'
+        cv2.imwrite(os.path.join(DEBUG_DIR, name), img)
+    except Exception as e:
+        log(f'[DEBUG] snap failed: {e}')
+
+
+def snap_roi(label: str, roi: np.ndarray, at_rect: Tuple[int, int, int, int]):
+
+    if not SAVE_DEBUG_IMAGES or roi is None:
+        return
+    try:
+        x, y, w, h = at_rect
+        tag = f'{dbg_name(label)}_x{x}_y{y}_w{w}_h{h}_{now_ts()}.png'
+        cv2.imwrite(os.path.join(DEBUG_DIR, f'pickup_roi_{tag}'), roi)
+    except Exception as e:
+        log(f'[DEBUG] snap_roi failed: {e}')
+
+
+def structured_log(step: str, **payload):
+
+    rec = {'ts': datetime.datetime.now().isoformat(timespec='milliseconds'),
+        'step': step, **payload}
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+except Exception as e:
+        pass
+# --- WIRE tpl_loader dependencies (score & logging) ---
+try:
+    # Ensure we have a module reference: prefer the actual tpl_loader module if present,
+    # otherwise fall back to the previously resolved _TPL_LOADER from sys.modules.
+    TL = globals().get('tpl_loader') or _TPL_LOADER
+    if TL is not None:
+        # чтобы tpl_loader.get_item_score видел разрешенные директории
+        TL.ALLOWED_LOOT_DIRS = ALLOWED_LOOT_DIRS
+        # чтобы tpl_loader мог логировать в общий лог
+        TL.structured_log = structured_log
+except Exception as e:
+    structured_log('tpl_loader_wire_fail', error=str(e))
+
+
+def adb_cmd(args: List[str], timeout: float=5.0) ->subprocess.CompletedProcess:
+    base = ['adb']
+    if DEVICE_ID:
+        base = ['adb', '-s', DEVICE_ID]
+    try:
+        return subprocess.run(base + args, stdout=subprocess.PIPE, stderr=
+            subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log('[WARN] ADB command timeout')
+        raise
+
+
+def screenshot_bgr(attempts: Optional[int]=None) ->Optional[np.ndarray]:
+    attempts = attempts or MAX_SCREENSHOT_ATTEMPTS
+    for i in range(attempts):
+        try:
+            proc = adb_cmd(['exec-out', 'screencap', '-p'], timeout=15.0)
+            data = proc.stdout
+            if not data:
+                raise RuntimeError('Пустой скриншот')
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError('Не удалось декодировать PNG скриншот')
+            if SAVE_DEBUG_IMAGES:
+                cv2.imwrite(os.path.join(DEBUG_DIR,
+                    f"{now_ts()}_{dbg_name('raw')}.png"), img)
+            return img
+        except Exception as e:
+            log(f'[WARN] Скриншот не получен ({i + 1}/{attempts}): {e}')
+            time.sleep(0.8)
+    return None
+
+
+def tap(x: int, y: int, reason: str=''):
+
+    x = max(SAFE_X1, min(SAFE_X2, int(x)))
+    y = max(SAFE_Y1, min(SAFE_Y2, int(y)))
+    structured_log('tap', x=x, y=y, reason=reason)
+    if DRY_RUN:
+        log(f"DRY_RUN TAP at ({x},{y}){'  // ' + reason if reason else ''}")
+        time.sleep(SLEEP_AFTER_TAP)
+        return
+    try:
+        adb_cmd(['shell', 'input', 'tap', str(x), str(y)])
+        log(f"TAP at ({x},{y}){'  // ' + reason if reason else ''}")
+    except Exception as e:
+        log(f'[ERROR] tap adb failed: {e}')
+    time.sleep(SLEEP_AFTER_TAP)
+
+def tap_raw(x: int, y: int, reason: str = ''):
+
+    """Тапает ровно по переданным координатам, игнорируя SAFE-зону."""
+    structured_log('tap_raw', x=int(x), y=int(y), reason=reason)
+    if DRY_RUN:
+        log(f"DRY_RUN TAP_RAW at ({x},{y}){'  // ' + reason if reason else ''}")
+        time.sleep(SLEEP_AFTER_TAP)
+        return
+    try:
+        adb_cmd(['shell', 'input', 'tap', str(int(x)), str(int(y))])
+        log(f"TAP_RAW at ({x},{y}){'  // ' + reason if reason else ''}")
+    except Exception as e:
+        log(f'[ERROR] tap_raw adb failed: {e}')
+    time.sleep(SLEEP_AFTER_TAP)
+
+
+def tap_fast(x: int, y: int, reason: str=''):
+
+    x = max(SAFE_X1, min(SAFE_X2, int(x)))
+    y = max(SAFE_Y1, min(SAFE_Y2, int(y)))
+    structured_log('tap_fast', x=x, y=y, reason=reason)
+    if DRY_RUN:
+        log(f"DRY_RUN TAP_FAST at ({x},{y}){'  // ' + reason if reason else ''}"
+            )
+        return
+    try:
+        adb_cmd(['shell', 'input', 'tap', str(x), str(y)])
+        log(f"TAP_FAST at ({x},{y}){'  // ' + reason if reason else ''}")
+    except Exception as e:
+        log(f'[ERROR] tap_fast adb failed: {e}')
+
+
+def device_swipe(dx: int, dy: int, duration_ms: int):
+
+    """
+    Человеческий свайп:
+    - X якорь в [200..800] (с учётом SAFE_X1/SAFE_X2), привязка к сетке 50px и лёгкий джиттер.
+    - Старт Y зависит от направления: вверх — старт снизу SAFE, вниз — старт сверху SAFE.
+    - Всегда в пределах SAFE_Y1..SAFE_Y2, никаких "мертвых" зон за границами.
+    - Снап до/после с отрисовкой вектора, логирует dy_req и dy_real.
+    """
+    # Параметры "живости"
+    grid = 50                      # шаг сетки
+    jitter_x = 6                   # +/- по X вокруг сетки
+    jitter_y = 8                   # +/- по Y вокруг сетки
+    margin_x = 12                  # отступ от границ SAFE по X
+    margin_y = 20                  # отступ от границ SAFE по Y
+    span_y = max(1, SAFE_Y2 - SAFE_Y1)
+
+    # Ограничения по X (внутри SAFE + требование 200..800)
+    x_min_wish, x_max_wish = 200, 800
+    x_min = max(SAFE_X1 + margin_x, x_min_wish)
+    x_max = min(SAFE_X2 - margin_x, x_max_wish)
+    if x_min > x_max:
+        # Если SAFE слишком узкая, fallback в центр SAFE
+        x_min, x_max = SAFE_X1 + margin_x, SAFE_X2 - margin_x
+
+    # Выбираем якорь X, привязываем к сетке и добавляем джиттер
+    x_anchor_raw = random.randint(x_min, x_max)
+    x_anchor = int(round(x_anchor_raw / grid) * grid)
+    x_anchor = clamp(x_anchor + random.randint(-jitter_x, jitter_x), x_min, x_max)
+
+    # Подбор стартовой Y по направлению (в процентах высоты SAFE)
+    if dy < 0:
+        # свайп вверх: старт ближе к низу SAFE
+        y_from_base = SAFE_Y2 - random.randint(int(span_y * 0.12), int(span_y * 0.20))
+    elif dy > 0:
+        # свайп вниз: старт ближе к верху SAFE
+        y_from_base = SAFE_Y1 + random.randint(int(span_y * 0.12), int(span_y * 0.20))
+    else:
+        # "нулевой" dy — старт из центральной зоны
+        y_from_base = SAFE_Y1 + random.randint(int(span_y * 0.35), int(span_y * 0.60))
+
+    # Привязка Y к сетке и джиттер
+    y_from = int(round(y_from_base / grid) * grid)
+    y_from = clamp(y_from + random.randint(-jitter_y, jitter_y), SAFE_Y1 + margin_y, SAFE_Y2 - margin_y)
+
+    # Конечные точки
+    y_to = clamp(y_from + dy, SAFE_Y1 + margin_y, SAFE_Y2 - margin_y)
+    x_to = clamp(x_anchor + dx, x_min, x_max)
+
+    # Если реальный ход получился слишком маленьким (например, упёрлись в SAFE) — слегка подвинем старт
+    dy_real = y_to - y_from
+    min_travel_px = max(90, int(span_y * 0.06))  # минимум “ощутимой” длины
+    if abs(dy_real) < min_travel_px and dy != 0:
+        # Попробуем ещё раз подобрать старт под направление
+        if dy < 0:
+            y_from = clamp(SAFE_Y2 - random.randint(int(span_y * 0.18), int(span_y * 0.24)),
+                           SAFE_Y1 + margin_y, SAFE_Y2 - margin_y)
+        else:
+            y_from = clamp(SAFE_Y1 + random.randint(int(span_y * 0.18), int(span_y * 0.24)),
+                           SAFE_Y1 + margin_y, SAFE_Y2 - margin_y)
+        y_to = clamp(y_from + dy, SAFE_Y1 + margin_y, SAFE_Y2 - margin_y)
+        dy_real = y_to - y_from
+
+    # Лёгкая рандомизация длительности
+    dur = int(max(80, duration_ms * random.uniform(0.82, 1.15)))
+
+    # Лог и визуализация
+    structured_log(
+        'swipe_plan_human',
+        start=[int(x_anchor), int(y_from)],
+        end=[int(x_to), int(y_to)],
+        dy_req=int(dy),
+        dy_real=int(dy_real),
+        duration_ms=int(dur)
+    )
+
+    pre = screenshot_bgr()
+    if pre is not None:
+        snap('swipe_before', pre, points=[(int(x_anchor), int(y_from)), (int(x_to), int(y_to))])
+
+    if not DRY_RUN:
+        try:
+            adb_cmd([
+                'shell', 'input', 'swipe',
+                str(int(x_anchor)), str(int(y_from)),
+                str(int(x_to)),    str(int(y_to)),
+                str(int(dur))
+            ])
+        except Exception as e:
+            log(f'[ERROR] swipe adb failed: {e}')
+
+    # Пауза с небольшим разбросом
+    time.sleep(max(0.0, SWIPE_PAUSE_MS / 200.0 + random.uniform(-0.13, 0.20)))
+
+    post = screenshot_bgr()
+    if post is not None:
+        snap('swipe_after', post, points=[(int(x_anchor), int(y_from)), (int(x_to), int(y_to))])
+# --- ADD: unified swipe helper (up-only) ---
+
+
+def frame_hash(gray: np.ndarray) ->int:
+    small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+    diff = small[:, 1:] > small[:, :-1]
+    h = 0
+    for i, v in enumerate(diff.flatten()):
+        if v:
+            h |= 1 << i
+    return h
+
+
+def page_hash_from_bgr(frame_bgr: np.ndarray) ->int:
+    return frame_hash(to_gray(frame_bgr))
+
+
+def detect_chat_top_y(frame_bgr: np.ndarray) ->int:
+    syschat_path = ui_tpl_path ('syschat')
+    H, W = frame_bgr.shape[:2]
+    tpl = imread_u8(syschat_path, cv2.IMREAD_COLOR)
+    if tpl is not None:
+        ok, score, (x, y, w, h) = match_scaled(to_gray(frame_bgr), to_gray(
+            tpl), 0.85, [0.9, 1.0, 1.1])
+        if ok:
+            return y
+    return int(H * 0.88)
+
+
+def _tpl(path: str) ->Optional[np.ndarray]:
+    if not path:
+        return None
+    return imread_u8(path, cv2.IMREAD_COLOR)
+
+
+def pickup_state(frame_bgr: np.ndarray, card_rect: Optional[Tuple[int, int,
+    int, int]]=None) ->Dict[str, Any]:
+    H, W = frame_bgr.shape[:2]
+
+    def _eval_roi(x1: int, y1: int, x2: int, y2: int, tag: str):
+        chat_top = detect_chat_top_y(frame_bgr)
+        x1 = clamp(x1, 0, W - 1)
+        x2 = clamp(x2, 1, W)
+        y1 = clamp(y1, 0, H - 1)
+        y2 = clamp(y2, 1, H)
+        y2 = min(y2, chat_top - 8)
+        if x2 <= x1 or y2 <= y1:
+            return {'state': 'out_of_view', 'score': None, 'box': None,
+                'method': f'{tag}_roi_clipped', 'roi_rect': (x1, y1, max(1,
+                x2 - x1), 1)}
+        roi_rect = x1, y1, x2 - x1, y2 - y1
+        roi = frame_bgr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return {'state': 'out_of_view', 'score': None, 'box': None,
+                'method': f'{tag}_empty_roi', 'roi_rect': roi_rect}
+        snap_roi(f'{tag}', roi, roi_rect)
+        gray_roi = to_gray(roi)
+        edge_roi = _scharr_mag(gray_roi)
+        act_tpls = []
+        for p in TPL_PICKUP_ACTIVE_LIST:
+            img = _tpl(p)
+            if img is not None:
+                act_tpls.append(img)
+        inact_tpl = _tpl(TPL_PICKUP_INACTIVE) if TPL_PICKUP_INACTIVE else None
+        best_templ = {'kind': None, 'score': -1.0, 'box': None}
+        for tpl in act_tpls:
+            ok, score, (tx, ty, tw, th) = match_scaled(gray_roi, to_gray(
+                tpl), PICKUP_TPL_THRESHOLD, PICKUP_SCALES)
+            if score > best_templ['score']:
+                best_templ = {'kind': 'active', 'score': score, 'box': (x1 +
+                    tx, y1 + ty, tw, th)}
+        if inact_tpl is not None:
+            ok, score, (tx, ty, tw, th) = match_scaled(gray_roi, to_gray(
+                inact_tpl), PICKUP_TPL_THRESHOLD, PICKUP_SCALES)
+            if score > best_templ['score']:
+                best_templ = {'kind': 'inactive', 'score': score, 'box': (
+                    x1 + tx, y1 + ty, tw, th)}
+        templ_score = max(0.0, best_templ['score'])
+        edge_score = 0.0
+        if best_templ['box']:
+            tpl_src = (act_tpls[0] if best_templ['kind'] == 'active' and
+                act_tpls else inact_tpl if inact_tpl is not None else None)
+            if tpl_src is not None:
+                tpl_e = _scharr_mag(to_gray(tpl_src))
+                ok, e_score, _ = match_scaled(edge_roi, tpl_e, 0.0,
+                    PICKUP_SCALES)
+                edge_score = float(e_score)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = (hsv[:, :, (1)] >= PICKUP_COLOR_SAT_MIN) & (hsv[:, :, (2)] >=
+            PICKUP_COLOR_VAL_MIN)
+        color_ratio = float(mask.sum()) / float(max(1, mask.size))
+        w_tpl = PICKUP_METHOD_WEIGHTS.get('templ', 0.6)
+        w_edge = PICKUP_METHOD_WEIGHTS.get('edge', 0.25)
+        w_col = PICKUP_METHOD_WEIGHTS.get('color', 0.15)
+        mixed = w_tpl * templ_score + w_edge * edge_score + w_col * color_ratio
+        if best_templ['kind'
+            ] == 'inactive' and templ_score >= PICKUP_INACTIVE_THRESHOLD:
+            return {'state': 'inactive', 'score': templ_score, 'box':
+                best_templ['box'], 'method': f'{tag}_tpl', 'roi_rect': roi_rect
+                }
+        elif best_templ['kind'
+            ] == 'active' and templ_score >= PICKUP_ACTIVE_THRESHOLD:
+            return {'state': 'active', 'score': templ_score, 'box':
+                best_templ['box'], 'method': f'{tag}_tpl', 'roi_rect': roi_rect
+                }
+        elif mixed >= PICKUP_ACTIVE_THRESHOLD:
+            return {'state': 'active', 'score': mixed, 'box': best_templ[
+                'box'], 'method': f'{tag}_mixed', 'roi_rect': roi_rect}
+        else:
+            return {'state': 'out_of_view', 'score': mixed, 'box':
+                best_templ['box'], 'method': f'{tag}_mixed', 'roi_rect':
+                roi_rect}
+    if card_rect:
+        x, y, w, h = card_rect
+        rx1 = x
+        ry1 = y + int(h * 0.3)
+        rx2 = min(W, x + w)
+        ry2 = min(H, y + h)
+        st_card = _eval_roi(rx1, ry1, rx2, ry2, tag='card')
+        if st_card['state'] in ('active', 'inactive'):
+            return st_card
+        structured_log('pickup_card_roi_failed', method=st_card.get(
+            'method'), score=st_card.get('score'))
+    px1, py1, px2, py2 = rect_from_rel(W, H, PICKUP_REL)
+    st_rel = _eval_roi(px1, py1, px2, py2, tag='rel')
+    if st_rel['state'] in ('active', 'inactive'):
+        return st_rel
+    fx1, fy1, fx2, fy2 = rect_from_rel(W, H, PICKUP_REL_CARD_FALLBACK)
+    return _eval_roi(fx1, fy1, fx2, fy2, tag='fallback')
+
+
+def _vec_direction(vec: List[int]) ->str:
+    dy = vec[1] if len(vec) > 1 else 0
+    return 'up' if dy < 0 else 'down' if dy > 0 else 'none'
+
+
+def _split_by_dir(vectors: List[List[int]]) ->Tuple[List[List[int]], List[
+    List[int]]]:
+    ups = [v for v in vectors if len(v) > 1 and v[1] < 0]
+    downs = [v for v in vectors if len(v) > 1 and v[1] > 0]
+    return ups, downs
+
+
+def _primary_direction_from_base_y(base_y: int, H: int) ->str:
+    if base_y > H * 0.66:
+        return 'up'
+    if base_y < H * 0.33:
+        return 'down'
+    return 'up'
+
+
+def swipe_until_visible_pickup(get_frame_fn, base_y: int, card_rect:
+    Optional[Tuple[int, int, int, int]]=None) ->Dict[str, Any]:
+    """
+    Алгоритм:
+    1. Если active/inactive в первом кадре — выходим.
+    2. Если box пустой — всегда свайпаем.
+    3. Если box есть и центр ниже середины — свайпаем.
+    4. Первый свайп — половина SAFE-зоны вверх.
+    5. Если всё ещё out_of_view — micro‑свайп и повторная проверка.
+    """
+    frame0 = get_frame_fn()
+    st0 = pickup_state(frame0, card_rect=card_rect)
+    structured_log('pickup_check_init', step_id=STEP_COUNTER, state=st0[
+        'state'])
+    snap('pickup_init', frame0, step_id=STEP_COUNTER)
+    if st0['state'] in ('active', 'inactive'):
+        return st0
+    safe_top = SAFE_Y1
+    safe_bottom = SAFE_Y2
+    span = safe_bottom - safe_top
+    midline = safe_top + span // 2
+    has_box = bool(st0.get('box'))
+    cy = st0['box'][1] + st0['box'][3] // 2 if has_box else None
+    need_swipe = not has_box or cy is not None and cy > midline
+    swipe_sid = mark_step('pickup_swipe_sequence')
+    structured_log('plan_swipe_to_pickup', step_id=swipe_sid, midline=int(
+        midline), cy=None if cy is None else int(cy), need_swipe=bool(
+        need_swipe))
+    if not need_swipe:
+        structured_log('early_exit_pickup_visible_or_upper_half', cy=cy,
+            midline=midline)
+        return st0
+    dy_strong = -max(300, span // 2)
+    structured_log('act_swipe', step_id=swipe_sid, kind='strong_up', dy=int
+        (dy_strong), duration_ms=SWIPE_DURATION_MS)
+    device_swipe(0, dy_strong, SWIPE_DURATION_MS)
+    time.sleep(POST_SWIPE_DELAY_MS / 1000.0)
+    frame1 = get_frame_fn()
+    st1 = pickup_state(frame1, card_rect=card_rect)
+    structured_log('outcome_swipe_check', step_id=swipe_sid, after=
+        'strong_up', state=st1['state'])
+    if st1['state'] in ('active', 'inactive'):
+        return st1
+    structured_log('act_swipe', step_id=swipe_sid, kind='micro_up', dy=-150,
+        duration_ms=SWIPE_DURATION_MS)
+    device_swipe(0, -150, SWIPE_DURATION_MS)
+    time.sleep(POST_SWIPE_DELAY_MS / 1000.0)
+    frame2 = get_frame_fn()
+    st2 = pickup_state(frame2, card_rect=card_rect)
+    structured_log('outcome_swipe_check', step_id=swipe_sid, after=
+        'micro_up', state=st2['state'])
+    return st2
+
+
+def collapse_if_open(panel_open: bool, click_xy: Tuple[int, int], reason:
+    str='collapse_item_panel') ->bool:
+    if not panel_open:
+        structured_log('collapse_skip', because='panel_already_closed')
+        return False
+    x, y = click_xy
+    tap(x, y, reason=reason)
+    time.sleep(0.3)
+    structured_log('collapsed')
+    return False
+
+
+sys.path.append(os.path.join(BASE_DIR, 'script'))
+sys.path.append(BASE_DIR)
+try:
+except Exception as e:
+    log(f'[ERROR] Cannot import tab_detector.detect_tab_states: {e}')
+
+    def detect_tab_states(bgr):
+        H, W = bgr.shape[:2]
+        return {'вещи': {'state': 'не видно', 'label_found': False,
+            'label_box': None, 'band_y': int(H * 0.1), 'scores': {'label': 
+            0.0, 'up': 0.0, 'down': 0.0}}, 'монстры': {'state': 'не видно',
+            'label_found': False, 'label_box': None, 'band_y': int(H * 0.1),
+            'scores': {'label': 0.0, 'up': 0.0, 'down': 0.0}}}
+EXTRA_LABELS = {'fights': ui_tpl_path ('fights_tab')}
+
+
+
+def detect_tabs_with_occlusion(frame_bgr: np.ndarray) ->Dict[str, Any]:
+    tabs = detect_tab_states(frame_bgr)
+    occluded_by_extra = False
+    fights_path = EXTRA_LABELS.get('fights')
+    tpl = imread_u8(fights_path, cv2.IMREAD_COLOR) if fights_path else None
+    if tpl is not None:
+        ok, score, (x, y, w, h) = match_scaled(to_gray(frame_bgr), to_gray(
+            tpl), 0.85, [0.9, 1.0, 1.1])
+        if ok:
+            occluded_by_extra = True
+            snap('extra_tab_fights', frame_bgr, rects=[(x, y, w, h)])
+            structured_log('tab_occluded_by_extra_detected', score=float(
+                score), box=[x, y, w, h])
+    tabs['occluded_by_extra'] = occluded_by_extra
+    return tabs
+
+
+SKIP_FILES = {'monsters_tab.png', 'items_tab.png', 'open_tab.png',
+    'close_tab.png', 'pickup.png', 'pickup_own.png', 'pickup_other.png',
+    'syschat.png', 'start.png', 'monsters_hdr.png', 'items_hdr.png',
+    'items_label.png'}
+
+
+def _stem(name: str) ->str:
+    base = os.path.basename(name)
+    s, _ = os.path.splitext(base)
+    return s
+
+
+def should_skip_tpl(base: str) ->bool:
+    if base in {'monsters_tab.png', 'items_tab.png', 'open_tab.png',
+        'close_tab.png', 'pickup.png', 'pickup_own.png', 'pickup_other.png',
+        'syschat.png', 'start.png', 'start.PNG', 'items_hdr.png',
+        'items_label.png'}:
+        return True
+    low = base.lower()
+    for sub in SKIP_SUBSTR:
+        if sub and sub in low:
+            return True
+    return False
+
+
+# --- OPTIONAL REPLACEMENT: use registry-aware loader for item names ---
+
+def merge_same_lines(boxes_scores, line_thr=35):
+
+    if not boxes_scores:
+        return []
+    keep, seen = [], set()
+    for idx, (bbox, score, name, slot_hash) in enumerate(boxes_scores):
+        _, y, _, h = bbox
+        y_group = int(round(y / float(line_thr)))
+        key = y_group, slot_hash
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(idx)
+    return keep
+
+
+def _raw_find_item_names(frame_bgr: np.ndarray, allowed_names: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+    """Поиск предметов по одному кадру с поддержкой мульти‑хитов на шаблон, с расширенной отладкой и фильтром по whitelist/allowed_names."""
+    if frame_bgr is None:
+        return []
+    H, W = frame_bgr.shape[:2]
+    try:
+        tabs = detect_tabs_with_occlusion(frame_bgr)
+        rx1, ry1, rx2, ry2 = compute_items_visible_roi(frame_bgr, tabs)
+    except Exception:
+        rx1, ry1, rx2, ry2 = ITEMS_ROI
+    x1 = clamp(int(rx1), 0, W - 1)
+    y1 = clamp(int(ry1), 0, H - 1)
+    x2 = clamp(int(rx2), 1, W)
+    y2 = clamp(int(ry2), 1, H)
+
+    structured_log(
+        'items_roi',
+        roi=[x1, y1, x2, y2],
+        safe=[int(SAFE_X1), int(SAFE_Y1), int(SAFE_X2), int(SAFE_Y2)],
+        dynamic_filter_active=bool(allowed_names),
+        dynamic_filter_size=(len(allowed_names) if allowed_names else 0)
+    )
+
+    if x2 <= x1 or y2 <= y1:
+        log(f'[ITEMS] Пустой ROI для списка: {rx1, ry1, rx2, ry2}')
+        try:
+            scan_files = []
+            for base_dir in ALLOWED_LOOT_DIRS:
+                for ext in ('*.png', '*.PNG'):
+                    scan_files.extend(glob.glob(os.path.join(base_dir, ext)))
+            structured_log('items_tpls_scan_fs', total=len(scan_files),
+                           sample=[os.path.basename(p) for p in scan_files[:20]])
+        except Exception as e:
+            structured_log('items_tpls_scan_fs_error', error=str(e))
+        return []
+
+    crop = frame_bgr[y1:y2, x1:x2]
+    if EXCLUDE_ZONES:
+        masked = crop.copy()
+        Hc, Wc = crop.shape[:2]
+        for zx1, zy1, zx2, zy2 in EXCLUDE_ZONES:
+            lx1 = clamp(zx1 - x1, 0, Wc)
+            ly1 = clamp(zy1 - y1, 0, Hc)
+            lx2 = clamp(zx2 - x1, 0, Wc)
+            ly2 = clamp(zy2 - y1, 0, Hc)
+            if lx2 > lx1 and ly2 > ly1:
+                masked[ly1:ly2, lx1:lx2] = 0
+        crop = masked
+        structured_log('items_exclude_zones_applied', zones=EXCLUDE_ZONES)
+
+    PREPROC_MODE = CFG['FIND'].get('PREPROC_MODE', 'gray')
+    proc = preprocess_gray(crop, mode=PREPROC_MODE)
+
+    # ВАЖНО: грузим шаблоны с учётом dynamic фильтра
+    tpls_triplets = get_item_name_templates(detect_only_names=allowed_names)  # (base, img_bgr, path)
+
+    if not tpls_triplets:
+        structured_log(
+            'items_tpls_empty',
+            reason='no_templates_loaded',
+            DETECT_ONLY_WHITELIST=bool(DETECT_ONLY_WHITELIST),
+            whitelist_size=len(ALLOWED_ITEM_NAMES or []),
+            allowed_loot_dirs=ALLOWED_LOOT_DIRS,
+            skip_substr=SKIP_SUBSTR,
+            dynamic_filter_active=bool(allowed_names),
+            dynamic_filter_size=(len(allowed_names) if allowed_names else 0)
+        )
+        log('[ITEMS] Нет шаблонов: проверь папки, whitelist/allowed_names и SKIP_SUBSTR')
+        return []
+
+    boxes_scores: List[Tuple[Tuple[int, int, int, int], float, str, int]] = []
+    SUPPRESS_Y = CFG['FIND'].get('SUPPRESS_Y', CFG.get('item_group_threshold', 50))
+    FIND_SCALES = CFG['FIND'].get('ITEM_SCALES', [1.0])
+    FIND_THRESHOLD = CFG['FIND'].get('THRESHOLD', 0.83)
+    grp_thr = int(CFG.get('GROUP_THRESHOLD', CFG.get('item_group_threshold', 50)))
+    max_lines = int(CFG.get('max_lines_to_collect', 12))
+    debug_img = frame_bgr.copy()
+
+    # --- основной поиск ---
+    for base, img_bgr, path in tpls_triplets:
+        if img_bgr is None:
+            continue
+        # Жёсткое ограничение, если активен динамический фильтр
+        if allowed_names and base not in allowed_names:
+            continue
+        if DETECT_ONLY_WHITELIST and not IGNORE_WHITELIST and base not in ALLOWED_ITEM_NAMES:
+            continue
+        tpl_gray_proc = TPL_CACHE.get(path or base, img_bgr, PREPROC_MODE)
+        matches = find_all_matches(
+            proc, tpl_gray_proc,
+            scales=FIND_SCALES,
+            threshold=FIND_THRESHOLD,
+            min_dy=SUPPRESS_Y
+        )
+        if matches:
+            structured_log('items_multi_hits', template=base, hits=len(matches))
+        h0, w0 = img_bgr.shape[:2]
+        for (mx, my, scale, score) in matches:
+            w = int(round(w0 * scale))
+            h = int(round(h0 * scale))
+            ay1, ay2 = y1 + my, y1 + my + h
+            ax1, ax2 = x1 + mx, x1 + mx + w
+            row_crop = frame_bgr[ay1:ay2, ax1:ax2]
+            if row_crop.size == 0:
+                continue
+            row_hash = frame_hash(to_gray(row_crop))
+            cy_abs = int((ay1 + ay2) // 2)
+            slot_hash = int((row_hash << 8 ^ cy_abs) & 0xFFFFFFFF)
+            snap(f'raw_slot_{slot_hash}', row_crop, rects=[(0, 0, w, h)])
+            structured_log('item_raw_hit', name=base, score=float(score), y=cy_abs, slot_hash=int(slot_hash))
+            boxes_scores.append(((mx, my, w, h), float(score), base, slot_hash))
+            cv2.rectangle(debug_img, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
+            cv2.circle(debug_img, (ax1 + w // 2, ay1 + h // 2), 3, (0, 0, 255), -1)
+
+    # --- fallback Scharr ---
+    if not boxes_scores:
+        gg = _scharr_mag(proc)
+        for base, img_bgr, path in tpls_triplets:
+            if img_bgr is None:
+                continue
+            if allowed_names and base not in allowed_names:
+                continue
+            if DETECT_ONLY_WHITELIST and not IGNORE_WHITELIST and base not in ALLOWED_ITEM_NAMES:
+                continue
+            tg = _scharr_mag(TPL_CACHE.get(path or base, img_bgr, PREPROC_MODE))
+            thr2 = max(0.83, FIND_THRESHOLD - 0.03)
+            matches = find_all_matches(
+                gg, tg,
+                scales=FIND_SCALES,
+                threshold=thr2,
+                min_dy=SUPPRESS_Y
+            )
+            if matches:
+                structured_log('items_multi_hits_scharr', template=base, hits=len(matches))
+            h0, w0 = img_bgr.shape[:2]
+            for (mx, my, scale, score) in matches:
+                w = int(round(w0 * scale))
+                h = int(round(h0 * scale))
+                ay1, ay2 = y1 + my, y1 + my + h
+                ax1, ax2 = x1 + mx, x1 + mx + w
+                row_crop = frame_bgr[ay1:ay2, ax1:ax2]
+                if row_crop.size == 0:
+                    continue
+                row_hash = frame_hash(to_gray(row_crop))
+                cy_abs = int((ay1 + ay2) // 2)
+                slot_hash = int((row_hash << 8 ^ cy_abs) & 0xFFFFFFFF)
+                snap(f'raw_slot_{slot_hash}', row_crop, rects=[(0, 0, w, h)])
+                structured_log('item_raw_hit', name=base, score=float(score), y=cy_abs, slot_hash=int(slot_hash))
+                boxes_scores.append(((mx, my, w, h), float(score), base, slot_hash))
+                cv2.rectangle(debug_img, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
+                cv2.circle(debug_img, (ax1 + w // 2, ay1 + h // 2), 3, (0, 0, 255), -1)
+
+    try:
+        if CFG.get('SAVE_DEBUG_IMAGES', False):
+            cv2.imwrite(os.path.join(CFG.get('DEBUG_DIR', '.'), "debug_matches.png"), debug_img)
+    except Exception as e:
+        print(f"[WARN] Failed to save debug_matches.png: {e}")
+
+    log(f'[ITEMS_RAW] совпадений (до группировки): {len(boxes_scores)} ROI=[{x1},{y1},{x2},{y2}]')
+
+    # --- группировка ---
+    if CFG.get('use_slot_grouping', True):
+        slot_map: Dict[int, Tuple[Tuple[int, int, int, int], float, str, int]] = {}
+        for bbox, score, name, slot_hash in boxes_scores:
+            _, y_rel, _, h_rel = bbox
+            slot_id = int((slot_hash << 8 ^ (y_rel + h_rel // 2)) & 0xFFFFFFFF)
+            if slot_id not in slot_map or score > slot_map[slot_id][1]:
+                slot_map[slot_id] = (bbox, score, name, slot_hash)
+        boxes_unique = list(slot_map.values())
+        keep = list(range(len(boxes_unique)))
+    else:
+        boxes_unique = boxes_scores
+        grp_thr = int(CFG.get('GROUP_THRESHOLD', CFG.get('item_group_threshold', 50)))
+        keep = merge_same_lines(boxes_unique, line_thr=grp_thr)
+
+    max_lines = int(CFG.get('max_lines_to_collect', 12))
+    if len(keep) > max_lines:
+        keep = sorted(keep, key=lambda i: boxes_unique[i][0][1])[:max_lines]
+
+    # --- расчёт очков и выбор топ-N ---
+    DEFAULT_W = CFG.get("item_score_width", 24)
+    DEFAULT_H = CFG.get("item_score_height", 12)
+    DEFAULT_SCALE = CFG.get("item_score_scale", 1.0)
+    DEFAULT_NAME = ""
+
+    items_scores: List[Tuple[str, float]] = []
+    for _, _, name, _ in [boxes_unique[i] for i in keep]:
+        try:
+            score_val = get_item_score(name, DEFAULT_W, DEFAULT_H, DEFAULT_SCALE, DEFAULT_NAME)
+        except Exception as e:
+            structured_log("item_score_fail", name=name, error=str(e))
+            score_val = 0.0
+        items_scores.append((name, float(score_val)))
+
+    items_scores.sort(key=lambda x: x[1], reverse=True)
+    structured_log("items_scores", items_scores=items_scores)
+
+    top_items = [tpl for tpl, _ in items_scores[:max_lines]]
+    structured_log("items_to_collect", items_to_collect=top_items)
+
+    # --- формирование результата ---
+    found: List[Dict[str, Any]] = []
+    rects_abs: List[Tuple[int, int, int, int]] = []
+    for i in keep:
+        (x, y, w, h), score, name, slot_hash = boxes_unique[i]
+        ax, ay = x1 + x, y1 + y
+        rects_abs.append((ax, ay, w, h))
+        found.append({
+            'name': name,
+            'score': float(score),
+            'center': (ax + w // 2, ay + h // 2),
+            'box': (ax, ay, w, h),
+            'slot_hash': int(slot_hash)
+        })
+
+    centers = [it['center'] for it in found]
+    snap('items_stabbed', frame_bgr, rects=rects_abs, points=centers)
+    structured_log('items_found_detail', count=len(found), names=[it['name'] for it in found])
+    log(f'[ITEMS_STAB] строк после группировки: {len(found)}')
+    return found
+
+
+
+def find_item_names(frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    """
+    Стабилизированный поиск: N кадров, пересечение по (name, slot_hash, y).
+    ВАЖНО: если есть цели после победы (get_victory_targets), используем их как dynamic-фильтр.
+    """
+    # 1) Подтягиваем цели победы как список basename name-шаблонов (…_name.png)
+    try:
+        victory_targets = set(get_victory_targets())
+    except Exception:
+        victory_targets = set()
+
+    structured_log(
+        'victory_filter_status',
+        active=bool(victory_targets),
+        size=(len(victory_targets) if victory_targets else 0),
+        sample=(list(victory_targets)[:10] if victory_targets else [])
+    )
+
+    # 2) Если стабилизация отключена — один проход, с учётом фильтра (если есть)
+    if FIND_STABILIZE_FRAMES <= 1:
+        return _raw_find_item_names(
+            frame_bgr,
+            allowed_names=(victory_targets if victory_targets else None)
+        )
+
+    # 3) Стабилизация: все проходы с одинаковым allowed_names
+    base_set = set()
+    stable_items: List[Dict[str, Any]] = []
+
+    items_first = _raw_find_item_names(
+        frame_bgr,
+        allowed_names=(victory_targets if victory_targets else None)
+    )
+    base_set = {(it['name'], int(it['slot_hash']), int(it['box'][1])) for it in items_first}
+    stable_items = items_first
+
+    for _ in range(FIND_STABILIZE_FRAMES - 1):
+        time.sleep(0.1)
+        fr = screenshot_bgr()
+        items_next = _raw_find_item_names(
+            
+            fr,
+            allowed_names=(victory_targets if victory_targets else None)
+        ) if fr is not None else []
+        curr_set = {(it['name'], int(it['slot_hash']), int(it['box'][1])) for it in items_next}
+        base_set &= curr_set
+
+    filtered = [
+        it for it in stable_items
+        if (it['name'], int(it['slot_hash']), int(it['box'][1])) in base_set
+    ]
+    log(f'[ITEMS_STAB] стабилизировано: {len(filtered)} / {len(stable_items)}')
+    dump_queue('initial', filtered)
+    return filtered
+
+
+def ensure_tab_state(tab_label: str, target_state: str) -> bool:
+    """
+    Ensure the given tab_label reaches target_state by tapping band line or chevrons;
+    takes fresh screenshots and re-checks state with a small polling loop.
+    """
+    plan_sid = mark_step(f'ensure_tab_{tab_label}_{target_state}')
+    frame = screenshot_bgr()
+    if frame is None:
+        structured_log('ensure_tab_no_frame', step_id=plan_sid)
+        return False
+    try:
+        tabs = detect_tab_states(frame)
+    except Exception as e:
+        structured_log('ensure_tab_detect_fail', step_id=plan_sid, error=str(e))
+        tabs = {}
+    cur = tabs.get(tab_label, {}) or {}
+    band_y = int(cur.get('band_y', SAFE_Y1))
+
+    def wait_and_check(poll_ms: int = 250, attempts: int = 6) -> bool:
+        """Poll screenshots and check tab state until it matches target_state or timeout."""
+        for _ in range(attempts):
+            time.sleep(poll_ms / 1000.0)
+            fr = screenshot_bgr()
+            if fr is None:
+                continue
+            try:
+                tbs = detect_tab_states(fr)
+                st = tbs.get(tab_label, {}).get('state')
+                if st == target_state:
+                    return True
+            except Exception:
+                # ignore transient detection errors and retry
+                continue
+        return False
+
+    # Try tapping band line if it is within SAFE area
+    if band_y >= SAFE_Y1:
+        structured_log('act_tab_toggle', step_id=plan_sid, method='band_line', x=180, y=band_y)
+        tap(180, band_y, reason=f'{tab_label}:band_line -> toggle')
+        if wait_and_check():
+            structured_log('outcome_tab_toggle', step_id=plan_sid, result='success', via='band_line')
+            return True
+    else:
+        structured_log('skip_band_line_tap', step_id=plan_sid, reason='band_y_below_safe', band_y=band_y, safe_y1=SAFE_Y1)
+
+    # Try chevrons as fallback
+    for cx in (1050, 950):
+        if band_y >= SAFE_Y1:
+            structured_log('act_tab_toggle', step_id=plan_sid, method='chevron', x=cx, y=band_y)
+            tap(cx, band_y, reason=f'{tab_label}:chevron -> toggle')
+            if wait_and_check():
+                structured_log('outcome_tab_toggle', step_id=plan_sid, result='success', via='chevron', x=cx, y=band_y)
+                return True
+
+    structured_log('outcome_tab_toggle', step_id=plan_sid, result='failed', reason='no_state_change')
+    log(f'[WARN] {tab_label}: state не меняется после label/band/chevron — пропускаем')
+    return False
+
+
+def verify_item_removed(name: str, base_hash: int, base_y: int) ->bool:
+    slot_thr = int(CFG.get('item_group_threshold', 50))
+    time.sleep(VERIFY1_MS / 1000.0)
+    frame1 = screenshot_bgr()
+    items1 = find_item_names(frame1) if frame1 is not None else []
+    same_line1 = [it for it in items1 if abs(int(it['box'][1]) - int(base_y
+        )) <= slot_thr]
+    if not same_line1:
+        return True
+    if any(int(it['slot_hash']) != int(base_hash) for it in same_line1):
+        return True
+    time.sleep(VERIFY2_MS / 1000.0)
+    frame2 = screenshot_bgr()
+    items2 = find_item_names(frame2) if frame2 is not None else []
+    same_line2 = [it for it in items2 if abs(int(it['box'][1]) - int(base_y
+        )) <= slot_thr]
+    if not same_line2:
+        return True
+    if any(int(it['slot_hash']) != int(base_hash) for it in same_line2):
+        return True
+    return False
+
+
+def auto_loot_once():
+
+    log('=== AUTO-LOOT START (strict top→bottom) ===')
+    min_y_cursor = SAFE_Y1
+    ensure_tab_state('монстры', 'закрыта')
+    ensure_tab_state('вещи', 'открыта')
+    super_swipe_before_loot()
+    log('[PRE-LOOT] Вкладки в нужном состоянии — делаем стартовый лист')
+    structured_log('skip_old_swipe', reason='removed legacy initial loot swipe')
+    # было:
+    # dy_init = -(SAFE_Y2 - SAFE_Y1) // 2
+    # device_swipe(0, dy_init, SWIPE_DURATION_MS)
+    # time.sleep(POST_SWIPE_DELAY_MS / 1000.0)
+
+    processed_slots_success: set[tuple[int, int]] = set()
+    processed_slots_skipped: set[tuple[int, int]] = set()
+    last_page_hash = None
+    frame = screenshot_bgr()
+    if frame is None:
+        return
+    page_hash = page_hash_from_bgr(frame)
+
+    def in_set(h, y, S):
+        return any(h == ph and abs(y - py) <= int(CFG.get(
+            'item_group_threshold', 50)) for ph, py in S)
+
+    def is_processed_success(item):
+        return in_set(int(item['slot_hash']), int(item['box'][1]),
+            processed_slots_success)
+
+    def is_marked_skipped(item):
+        return in_set(int(item['slot_hash']), int(item['box'][1]),
+            processed_slots_skipped)
+    tabs = detect_tabs_with_occlusion(frame)
+    if tabs.get('occluded_by_extra'):
+        fix_sid = mark_step('fights_tab_shift_fix')
+        structured_log('plan_fix_fights_shift', step_id=fix_sid, reason=
+            'fights_tab_detected')
+        log("[TABS] Обнаружена вкладка 'Сражения' — корректирующий свайп вверх >150px"
+            )
+        dy = -400
+        device_swipe(0, dy, SWIPE_DURATION_MS)
+        time.sleep(POST_SWIPE_DELAY_MS / 1000.0)
+        frame = screenshot_bgr()
+        tabs = detect_tabs_with_occlusion(frame)
+        page_hash = page_hash_from_bgr(frame)
+        structured_log('outcome_fix_fights_shift', step_id=fix_sid, dy=dy,
+            occluded_by_extra=bool(tabs.get('occluded_by_extra')))
+    raw_items = _raw_find_item_names(frame)
+    if tabs.get('occluded_by_extra') and len(raw_items) < 3:
+        structured_log('occlusion_fix', reason='few_items_visible')
+        device_swipe(0, -700, SWIPE_DURATION_MS)
+        time.sleep(POST_SWIPE_DELAY_MS / 1000.0)
+        frame = screenshot_bgr()
+        page_hash = page_hash_from_bgr(frame)
+    items = find_item_names(frame) or []
+    items.sort(key=lambda d: d['box'][1])
+    dump_queue('initial', items)
+    structured_log('list_scan', count=len(items))
+    if page_hash == last_page_hash:
+        items = [it for it in items if not is_processed_success(it) and not
+            is_marked_skipped(it)]
+        structured_log('filter_same_page', same=True, kept=len(items))
+    else:
+        processed_slots_skipped.clear()
+        processed_slots_success.clear()
+        structured_log('filter_same_page', same=False, reset_sets=True)
+    last_page_hash = page_hash
+
+    def quick_double_tap_from_slot(slot):
+        label_box_xywh = slot['box']
+        safe_xywh = SAFE_X1, SAFE_Y1, SAFE_X2 - SAFE_X1, SAFE_Y2 - SAFE_Y1
+        frame_dbg = screenshot_bgr()
+        quick_tap_for_label(tap_fn=tap_fast, label_box_xywh=label_box_xywh,
+            safe_xywh=safe_xywh, cfg=CFG, frame_bgr=frame_dbg, slot_id=None,
+            label_text=slot.get('name'))
+    while items:
+        current = items[0]
+        name = current['name']
+        cx, cy = current['center']
+        base_hash = int(current['slot_hash'])
+        base_y = int(current['box'][1])
+        if is_processed_success(current):
+            items.pop(0)
+            continue
+        log(f"[ITEM] open '{name}' at {current['center']} y={base_y} hash={hex(base_hash)}"
+            )
+        structured_log('focus_item', item=name, box=current['box'], center=
+            current['center'], base_hash=hex(base_hash))
+        if not ALLOW_PICKUP_OTHER and name not in ALLOWED_ITEM_NAMES:
+            log(f"[FLOW] '{name}' не в whitelist — пропуск без открытия")
+            structured_log('skip_non_whitelist', item=name, box=current['box'])
+            processed_slots_success.add((base_hash, base_y))
+            items.pop(0)
+            continue
+        quick_double_tap_from_slot(current)
+        if verify_item_removed(name, base_hash, base_y):
+            log(f"[FLOW] '{name}' подобран быстрым тапом — подтверждено")
+            processed_slots_success.add((base_hash, base_y))
+            update_slot_lifecycle([current], stage='picked_by_bot')
+            items.pop(0)
+            continue
+        tap(cx, cy, reason='open_item_card')
+        panel_open = True
+        time.sleep(max(0.001, CARD_OPEN_DELAY_MS / 1000.0))
+        frame_card = screenshot_bgr()
+        if frame_card is None:
+            panel_open = collapse_if_open(panel_open, (cx, cy))
+            processed_slots_skipped.add((base_hash, base_y))
+            items.pop(0)
+            continue
+        H, W = frame_card.shape[:2]
+        chat_top = detect_chat_top_y(frame_card)
+        top = clamp(cy - 300, SAFE_Y1, SAFE_Y2 - 60)
+        bottom = clamp(min(chat_top - 8, SAFE_Y2), top + 60, SAFE_Y2)
+        card_rect = int(W * 0.56), top, int(W * 0.42), bottom - top
+        st = swipe_until_visible_pickup(screenshot_bgr, base_y=base_y,
+            card_rect=card_rect)
+        state, box = st['state'], st.get('box')
+        log(f"[PICKUP] state={state} score={st.get('score')} method={st.get('method')}"
+            )
+        if state == 'inactive':
+            panel_open = collapse_if_open(panel_open, (cx, cy))
+            if ABORT_ON_FIRST_INACTIVE:
+                structured_log('inactive_abort_context', current={'name':
+                    name, 'y': base_y})
+                structured_log('exit_reason', reason='pickup_button_inactive')
+                finalize_slot_lifecycle()
+                ensure_tab_state('вещи', 'закрыта')
+                log('=== AUTO-LOOT END ===')
+                return
+            else:
+                processed_slots_skipped.add((base_hash, base_y))
+                items.pop(0)
+                continue
+        if state == 'active' and box:
+            bx, by = box[0] + box[2] // 2, box[1] + box[3] // 2
+            tap(bx, by, reason='pickup')
+            if verify_item_removed(name, base_hash, base_y):
+                log(f"[FLOW] '{name}' подобран — подтверждено")
+            else:
+                log(f"[WARN] '{name}' не исчез — но помечаем обработанным")
+            processed_slots_success.add((base_hash, base_y))
+            update_slot_lifecycle([current], stage='picked_by_bot')
+        if state == 'out_of_view':
+            processed_slots_skipped.add((base_hash, base_y))
+            update_slot_lifecycle([current], stage='taken_by_other')
+        rescan_sid = mark_step('rescan_items')
+        structured_log('plan_rescan', step_id=rescan_sid, reason=
+            'post_item_action_or_scroll')
+        frame = screenshot_bgr()
+        page_hash = page_hash_from_bgr(frame)
+        structured_log('act_rescan', step_id=rescan_sid, page_hash=int(
+            page_hash))
+        all_items = find_item_names(frame) or []
+        filtered = [it for it in all_items if not in_set(int(it['slot_hash'
+            ]), int(it['box'][1]), processed_slots_success)]
+        items = sorted(filtered, key=lambda d: d['box'][1])
+        dump_queue('after_rescan', items)
+        structured_log('outcome_rescan', step_id=rescan_sid, count=len(
+            items), page_hash=int(page_hash))
+        last_page_hash = page_hash
+        tabs = detect_tabs_with_occlusion(frame)
+        if not items and tabs.get('occluded_by_extra'):
+            structured_log('exit_reason', reason=
+                'items_tab_hidden_until_fight_end')
+            log('[FLOW] прекращаем лут — вкладка вещей скрыта сражениями')
+            finalize_slot_lifecycle()
+            return
+        if not items:
+            pag_sid = mark_step('pagination')
+            structured_log('plan_pagination', step_id=pag_sid, vector=[0, 
+                800], duration_ms=600)
+            take_frame = screenshot_bgr()
+            before_path = dbg_save('before_pagination_swipe', take_frame)
+            structured_log('act_pagination', step_id=pag_sid,
+                page_hash_before=int(page_hash_from_bgr(take_frame)),
+                image_before=before_path)
+            device_swipe(0, 800, 600)
+            time.sleep(0.5)
+            take_frame = screenshot_bgr()
+            after_path = dbg_save('after_pagination_swipe', take_frame)
+            page_hash = page_hash_from_bgr(take_frame)
+            last_page_hash = page_hash
+            new_items = find_item_names(take_frame) or []
+            filtered_new = [it for it in new_items if not in_set(int(it[
+                'slot_hash']), int(it['box'][1]), processed_slots_success)]
+            items = sorted(filtered_new, key=lambda d: d['box'][1])
+            structured_log('outcome_pagination', step_id=pag_sid, count=len
+                (items), page_hash_after=int(page_hash), image_after=after_path
+                )
+            tabs = detect_tabs_with_occlusion(take_frame)
+            if tabs.get('occluded_by_extra'):
+                structured_log('exit_reason', reason=
+                    'items_tab_hidden_until_fight_end')
+                log('[FLOW] прекращаем лут — вкладка вещей скрыта сражениями')
+                finalize_slot_lifecycle()
+                return
+    finalize_slot_lifecycle()
+    ensure_tab_state('вещи', 'закрыта')
+    log('=== AUTO-LOOT END ===')
+
+
+def main():
+
+    try:
+        adb_cmd(['get-state'])
+    except Exception as e:
+        log(f'[ERROR] ADB недоступен: {e}')
+        return
+    rounds = 0
+    log('[MAIN] Entering main loop')
+    try:
+        while True:
+            rounds += 1
+            if MAX_LOOT_ROUNDS and rounds > MAX_LOOT_ROUNDS:
+                log(f'[MAIN] reached max_loot_rounds={MAX_LOOT_ROUNDS}, exiting'
+                    )
+                break
+            try:
+                auto_loot_once()
+            except Exception as e:
+                log(f'[ERROR] Exception in auto_loot_once: {e}')
+            log(f'[MAIN] Sleeping {DELAY_BETWEEN_LOOPS}s before next loop')
+            time.sleep(DELAY_BETWEEN_LOOPS)
+    except KeyboardInterrupt:
+        log('[MAIN] Interrupted by user (KeyboardInterrupt)')
+    except Exception as e:
+        log(f'[MAIN] Unexpected error: {e}')
+    finally:
+        log('[MAIN] Exiting main')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+import os
+import time
+import cv2
+import numpy as np
+import pyautogui
+from datetime import datetime
+
+# ========================
+# Конфигурация
+# ========================
+
+class Cfg:
+    # Пути (под твои каталоги)
+    TPL_DIR = r"C:\bot\tpl\my"
+    SCREENS_DIR = r"C:\bot\screens"
+    LOGS_DIR = r"C:\bot\logs"
+
+    # Регион окна эмулятора/игры (left, top, width, height)
+    # ВРЕМЕННО: поставь примерные значения и проверь DRY_RUN-ом.
+    WINDOW_REGION = (200, 120, 900, 520)
+
+    # Пороги сопоставления шаблонов
+    THRESH_DEFAULT = 0.82
+    THRESH_STRICT = 0.87
+
+    # Масштабы для устойчивости к небольшому скейлу
+    SCALES = [0.92, 0.96, 1.0, 1.04, 1.08]
+
+    # Диагностика
+    DRY_RUN = False          # True — только аннотировать, без кликов
+    SAVE_ANNOTATED = True
+    SHOW_DEBUG = False       # оставить False (headless)
+
+    # Лимиты/тайминг
+    MAX_LOOT_CLICKS = 20     # защита от бесконечного цикла
+    CLICK_DELAY = 0.15
+    AFTER_POPUP_WAIT = 0.25
+    AFTER_PICKUP_WAIT = 0.35
+    AFTER_CLOSE_WAIT = 0.25
+    TAB_SWITCH_WAIT = 0.25
+
+    # Логика “первого предмета”: кликаем по списку относительно якоря items_label
+    # Эти оффсеты — стартовая гипотеза; проверь на DRY_RUN и подстрой.
+    FIRST_ITEM_OFFSET = (40, 150)   # dx, dy от левого-верхнего угла items_label.png
+    SECOND_ITEM_OFFSET = (40, 210)  # запасной клик, если первый не открыл попап
+
+    # Безопасная зона клика для закрытия попапа (относительно popup_auto)
+    POPUP_CLOSE_OFFSET = (0, -30)   # кликнем чуть выше заголовка попапа
+    POPUP_SAFE_CLICK_OUTSIDE = (30, 30)  # небольшой смещённый клик “в нейтраль”
+
+    # Имена шаблонов
+    TPL = {
+        "items_label": "items_label.png",
+        "items_tab":   "items_tab.png",
+
+        "popup_any":   "popup_auto.png",
+
+        "pickup_active_primary": "pickup.png",
+        "pickup_active_alt":     "pickup_own.png",
+        "pickup_inactive":       "pickup_other.png",
+    }
+
+# ========================
+# Утилиты: файлы/логи
+# ========================
+
+def ensure_dirs():
+    os.makedirs(Cfg.SCREENS_DIR, exist_ok=True)
+    os.makedirs(Cfg.LOGS_DIR, exist_ok=True)
+
+def now_str():
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+LOG_FILE = None
+def init_log():
+    global LOG_FILE
+    ensure_dirs()
+    LOG_FILE = os.path.join(Cfg.LOGS_DIR, f"loot_{now_str()}.log")
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write(f"[init] {datetime.now()}\n")
+
+def log(msg):
+    s = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}"
+    print(s)
+    if LOG_FILE:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(s + "\n")
+
+def save_debug(img_bgr, name, boxes=None):
+    if not Cfg.SAVE_ANNOTATED:
+        return
+    out = img_bgr.copy()
+    if boxes:
+        for (x, y, w, h), color, label in boxes:
+            cv2.rectangle(out, (x, y), (x+w, y+h), color, 2)
+            if label:
+                cv2.putText(out, label, (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    path = os.path.join(Cfg.SCREENS_DIR, f"{name}_{now_str()}.png")
+    cv2.imwrite(path, out)
+
+# ========================
+# Скрин/клик
+# ========================
+
+def grab_window_bgr():
+    # скриншот указанного региона, возвращаем BGR
+    l, t, w, h = Cfg.WINDOW_REGION
+    im = pyautogui.screenshot(region=(l, t, w, h))
+    im = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+    return im
+
+def global_to_window(pt):
+    l, t, _, _ = Cfg.WINDOW_REGION
+    return (l + pt[0], t + pt[1])
+
+def safe_click(x, y, pause=Cfg.CLICK_DELAY):
+    if Cfg.DRY_RUN:
+        log(f"[DRY] click at {x}, {y}")
+        return
+    pyautogui.click(x=x, y=y)
+    time.sleep(pause)
+
+def click_win(pt):
+    gx, gy = global_to_window(pt)
+    safe_click(gx, gy)
+
+# ========================
+# Vision: шаблоны/матчинг
+# ========================
+
+class Templates:
+    cache = {}
+
+    @staticmethod
+    def load(name_key, as_gray=True):
+        if name_key in Templates.cache:
+            return Templates.cache[name_key]
+        filename = Cfg.TPL.get(name_key)
+        if not filename:
+            raise ValueError(f"Unknown template key: {name_key}")
+        path = os.path.join(Cfg.TPL_DIR, filename)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE if as_gray else cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Template not found: {path}")
+        Templates.cache[name_key] = img
+        return img
+
+def to_gray(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+def match_template_multi(img_gray, tpl_gray, threshold, scales):
+    best = None
+    for s in scales:
+        h = int(tpl_gray.shape[0] * s)
+        w = int(tpl_gray.shape[1] * s)
+        if h < 8 or w < 8:
+            continue
+        tpl_r = cv2.resize(tpl_gray, (w, h), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(img_gray, tpl_r, cv2.TM_CCOEFF_NORMED)
+        minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
+        if maxVal >= threshold:
+            if (best is None) or (maxVal > best["score"]):
+                best = {
+                    "score": maxVal,
+                    "pt": maxLoc,
+                    "wh": (w, h),
+                    "scale": s
+                }
+    return best  # dict or None
+
+def find_one(img_bgr, key, threshold=None, scales=None):
+    if threshold is None:
+        threshold = Cfg.THRESH_DEFAULT
+    if scales is None:
+        scales = Cfg.SCALES
+    tpl = Templates.load(key)
+    gray = to_gray(img_bgr)
+    m = match_template_multi(gray, tpl, threshold, scales)
+    if m:
+        x, y = m["pt"]
+        w, h = m["wh"]
+        return (x, y, w, h, m["score"])
+    return None
+
+def find_any(img_bgr, keys, threshold=None, scales=None):
+    best = None
+    for k in keys:
+        m = find_one(img_bgr, k, threshold, scales)
+        if m and (best is None or m[4] > best[4]):
+            best = (k, *m)
+    return best  # (key, x, y, w, h, score) or None
+
+# ========================
+# Высокоуровневая логика
+# ========================
+
+def ensure_items_tab():
+    img = grab_window_bgr()
+    # Если видим label — вкладка уже активна
+    m = find_one(img, "items_label", threshold=Cfg.THRESH_STRICT)
+    if m:
+        save_debug(img, "items_tab_ok", [((m[0], m[1], m[2], m[3]), (0, 255, 0), "items_label")])
+        log("Вкладка 'вещи' уже активна.")
+        return True
+
+    # Иначе попробуем кликнуть по самой вкладке
+    mtab = find_one(img, "items_tab", threshold=Cfg.THRESH_DEFAULT)
+    if not mtab:
+        save_debug(img, "items_tab_not_found")
+        log("Не нашёл 'items_tab'. Останов.")
+        return False
+
+    x, y, w, h, sc = mtab
+    cx, cy = x + w//2, y + h//2
+    save_debug(img, "items_tab_click", [((x, y, w, h), (0, 165, 255), f"items_tab {sc:.2f}")])
+    click_win((cx, cy))
+    time.sleep(Cfg.TAB_SWITCH_WAIT)
+
+    # Верификация
+    img2 = grab_window_bgr()
+    verify = find_one(img2, "items_label", threshold=Cfg.THRESH_STRICT)
+    save_debug(img2, "items_tab_verify", [((verify[0], verify[1], verify[2], verify[3]), (0, 255, 0), "verified")] if verify else None)
+    ok = verify is not None
+    log("Активировал вкладку 'вещи'." if ok else "Не удалось активировать вкладку 'вещи'.")
+    return ok
+
+def popup_is_open(img=None):
+    if img is None:
+        img = grab_window_bgr()
+    m = find_one(img, "popup_any", threshold=Cfg.THRESH_DEFAULT)
+    return m  # (x, y, w, h, score) или None
+
+def open_first_item_popup():
+    img = grab_window_bgr()
+    # Если попап уже открыт — ничего не делаем
+    if popup_is_open(img):
+        log("Попап уже открыт.")
+        return True
+
+    label = find_one(img, "items_label", threshold=Cfg.THRESH_STRICT)
+    if not label:
+        save_debug(img, "first_item_no_label")
+        log("Не нашёл items_label для ориентира. Останов.")
+        return False
+
+    lx, ly, lw, lh, _ = label
+    # Пробуем кликнуть по первому предмету (оффсет относительно items_label)
+    targets = [
+        (lx + Cfg.FIRST_ITEM_OFFSET[0],  ly + Cfg.FIRST_ITEM_OFFSET[1]),
+        (lx + Cfg.SECOND_ITEM_OFFSET[0], ly + Cfg.SECOND_ITEM_OFFSET[1]),
+    ]
+
+    for i, pt in enumerate(targets, 1):
+        save_debug(img, f"click_first_item_try{i}", [((lx, ly, lw, lh), (0, 255, 0), "items_label")])
+        click_win(pt)
+        time.sleep(Cfg.AFTER_POPUP_WAIT)
+        img2 = grab_window_bgr()
+        if popup_is_open(img2):
+            log(f"Открыл попап предмета (попытка {i}).")
+            return True
+        else:
+            log(f"Попытка {i}: попап не открылся, пробуем следующий таргет.")
+
+    save_debug(img2, "first_item_popup_fail")
+    log("Не удалось открыть попап предмета.")
+    return False
+
+def detect_pickup_state():
+    img = grab_window_bgr()
+    pop = popup_is_open(img)
+    if not pop:
+        save_debug(img, "detect_no_popup")
+        log("Попап не найден при проверке 'подобрать'.")
+        return "no_popup", None
+
+    # Сначала ищем активную кнопку (приоритет)
+    active = find_any(img, ["pickup_active_primary", "pickup_active_alt"], threshold=Cfg.THRESH_DEFAULT)
+    if active:
+        _, x, y, w, h, sc = active
+        save_debug(img, "pickup_active", [((x, y, w, h), (0, 255, 0), f"active {sc:.2f}")])
+        log("Кнопка 'подобрать' активна.")
+        return "active", (x, y, w, h)
+
+    # Затем неактивную
+    ina = find_one(img, "pickup_inactive", threshold=Cfg.THRESH_DEFAULT)
+    if ina:
+        x, y, w, h, sc = ina
+        save_debug(img, "pickup_inactive", [((x, y, w, h), (0, 165, 255), f"inactive {sc:.2f}")])
+        log("Кнопка 'подобрать' неактивна.")
+        return "inactive", (x, y, w, h)
+
+    save_debug(img, "pickup_unknown")
+    log("Не смог определить состояние кнопки 'подобрать'.")
+    return "unknown", None
+
+def click_pickup(btn_box):
+    x, y, w, h = btn_box
+    cx, cy = x + w//2, y + h//2
+    click_win((cx, cy))
+    time.sleep(Cfg.AFTER_PICKUP_WAIT)
+    log("Клик по 'подобрать' выполнен.")
+
+def close_popup():
+    img = grab_window_bgr()
+    pop = popup_is_open(img)
+    if not pop:
+        log("Попап уже закрыт.")
+        return True
+
+    px, py, pw, ph, _ = pop
+    # Пробуем безопасный клик чуть выше заголовка попапа
+    cx = px + pw//2 + Cfg.POPUP_CLOSE_OFFSET[0]
+    cy = py + Cfg.POPUP_CLOSE_OFFSET[1] if Cfg.POPUP_CLOSE_OFFSET[1] < 0 else py + Cfg.POPUP_CLOSE_OFFSET[1]
+    click_win((cx, cy))
+    time.sleep(Cfg.AFTER_CLOSE_WAIT)
+
+    img2 = grab_window_bgr()
+    if not popup_is_open(img2):
+        log("Попап закрыт (клик по заголовку/над ним).")
+        return True
+
+    # Запасной клик — в безопасную точку в стороне
+    sx = px + pw + Cfg.POPUP_SAFE_CLICK_OUTSIDE[0]
+    sy = py + ph + Cfg.POPUP_SAFE_CLICK_OUTSIDE[1]
+    click_win((sx, sy))
+    time.sleep(Cfg.AFTER_CLOSE_WAIT)
+
+    img3 = grab_window_bgr()
+    ok = not popup_is_open(img3)
+    log("Попап закрыт запасным кликом." if ok else "Попап не закрылся.")
+    return ok
+
+def loot_cycle():
+    if not ensure_items_tab():
+        return {"ok": False, "reason": "items_tab_not_available"}
+
+    total_clicks = 0
+
+    # Шаг 1: открыть попап первого предмета
+    if not open_first_item_popup():
+        return {"ok": False, "reason": "cannot_open_first_popup"}
+
+    # Шаг 2: крутить, пока 'подобрать' активна
+    while total_clicks < Cfg.MAX_LOOT_CLICKS:
+        state, box = detect_pickup_state()
+
+        if state == "active" and box:
+            click_pickup(box)
+            total_clicks += 1
+            # остаёмся в попапе — проверим снова
+            continue
+
+        if state in ("inactive", "unknown"):
+            # Закрываем попап и выходим из цикла (лут закончен)
+            closed = close_popup()
+            if not closed:
+                save_debug(grab_window_bgr(), "fail_close_popup")
+                return {"ok": False, "reason": "popup_not_closed"}
+            log("Кнопка неактивна/неопознана — завершаем лутинг.")
+            break
+
+        if state == "no_popup":
+            # Попап исчез — пытаемся открыть снова (защита от рассинхронизации)
+            if not open_first_item_popup():
+                return {"ok": False, "reason": "cannot_reopen_popup"}
+            continue
+
+    return {"ok": True, "picked": total_clicks}
+
+def main():
+    pyautogui.FAILSAFE = True
+    ensure_dirs()
+    init_log()
+    log("Старт лутинга.")
+    res = loot_cycle()
+    log(f"Результат: {res}")
+    log("Готово.")
+
+if __name__ == "__main__":
+    main()

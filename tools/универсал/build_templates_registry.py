@@ -1,0 +1,94 @@
+# C:/bot/tools/универсал/build_templates_registry.py
+import glob
+import json
+import os
+import re
+import unicodedata
+
+BASE_DIR = "C:/bot"
+CFG_FILE = os.path.join(BASE_DIR, "tools", "cfg", "config.json")
+OUT_FILE = os.path.join(BASE_DIR, "tools", "cfg", "templates_registry.json")
+
+
+def nfkc_lower(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).lower()
+
+
+def norm_stem(fn: str) -> str:
+    s = nfkc_lower(fn).replace("\\", "/")
+    s = os.path.basename(s)
+    s = re.sub(r"\.(png|jpg|jpeg)$", "", s)
+    s = s.replace("yantar", "янтарь")
+    s = re.sub(r"_name$", "", s)
+    s = re.sub(r"_icon$", "", s)
+    s = re.sub(r"_(\d+)$", "", s)
+    return s
+
+
+def join(*parts):
+    return os.path.join(*parts).replace("\\", "/")
+
+
+def load_cfg():
+    with open(CFG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def scan_dir(pattern, key_prefix, strip_suffix=None):
+    out = {}
+    for p in sorted(glob.glob(pattern)):
+        base = os.path.basename(p)
+        stem = norm_stem(base if not strip_suffix else re.sub(strip_suffix, "", base))
+        key = f"{key_prefix}.{stem}"
+        out[nfkc_lower(key)] = p.replace("\\", "/")
+    return out
+
+
+def main():
+    cfg = load_cfg()
+    TP = cfg.get("TEMPLATES_PATHS", {})
+
+    reg = {}
+
+    # UI
+    ui_dir = TP.get("UI_DIR", join(BASE_DIR, "tpl", "служебные"))
+    for p in glob.glob(join(ui_dir, "*.png")):
+        name = nfkc_lower(os.path.splitext(os.path.basename(p))[0])
+        reg[f"ui.{name}"] = p.replace("\\", "/")
+
+    # Items: names/icons/desc
+    reg.update(scan_dir(join(TP.get("ITEM_NAMES_DIR", join(BASE_DIR, "tpl", "имя_предметов")), "*.png"), "item.name"))
+    reg.update(
+        scan_dir(join(TP.get("ITEM_ICONS_DIR", join(BASE_DIR, "tpl", "иконки_предметов")), "*.png"), "item.icon")
+    )
+    reg.update(
+        scan_dir(join(TP.get("ITEM_DESC_DIR", join(BASE_DIR, "tpl", "описание_предметов")), "*.png"), "item.desc")
+    )
+
+    # Runes: names/icons/desc
+    reg.update(scan_dir(join(TP.get("RUNE_NAMES_DIR", join(BASE_DIR, "tpl", "имя_рун")), "*.png"), "rune.name"))
+    reg.update(scan_dir(join(TP.get("RUNE_ICONS_DIR", join(BASE_DIR, "tpl", "иконки_рун")), "*.png"), "rune.icon"))
+    reg.update(scan_dir(join(TP.get("RUNE_DESC_DIR", join(BASE_DIR, "tpl", "описание_рун")), "*.png"), "rune.desc"))
+    # SKILLS: names/icons/desc
+    reg.update(scan_dir(join(TP.get("SKILLS_NAMES_DIR", join(BASE_DIR, "tpl", "имя_навыков")), "*.png"), "skills.name"))
+    reg.update(
+        scan_dir(join(TP.get("SKILLS_ICONS_DIR", join(BASE_DIR, "tpl", "иконки_навыков")), "*.png"), "skills.icon")
+    )
+    reg.update(
+        scan_dir(join(TP.get("SKILLS_DESC_DIR", join(BASE_DIR, "tpl", "описание_навыков")), "*.png"), "skills.desc")
+    )
+
+    # Monsters
+    reg.update(scan_dir(join(TP.get("MONSTERS_DIR", join(BASE_DIR, "tpl", "монстры")), "*.png"), "monster"))
+    reg.update(
+        scan_dir(join(TP.get("MONSTERS_FULL_DIR", join(BASE_DIR, "tpl", "монстры_full")), "*.png"), "monster_full")
+    )
+
+    with open(OUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(reg, f, ensure_ascii=False, indent=2)
+
+    print(f"[OK] templates_registry.json -> {OUT_FILE} ({len(reg)} keys)")
+
+
+if __name__ == "__main__":
+    main()

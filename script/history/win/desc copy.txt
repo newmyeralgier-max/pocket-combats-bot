@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+"""
+Нарезка правой колонки на блоки по серым разделителям и сохранение только тех,
+чьи названия есть в not_full.json (список строк с подчёркиваниями).
+
+Вход:  C:\bot\tpl\монстры_full   (файлы с правой колонкой "Возможная добыча")
+JSON:  C:\bot\tools\cfg\not_full.json  (массив строк: ["горелое_дерево", ...])
+Выход: C:\bot\характеристики2    (с именами как в "характеристики": <name>_full.png)
+Диагностика: C:\bot\характеристики2_debug (оверлеи и логи)
+"""
+
+import re
+import json
+import unicodedata
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+
+# ----------- НАСТРОЙКИ ПУТЕЙ (ничего менять не нужно) -----------
+INPUT_DIR = Path(r"C:\bot\tpl\монстры_full")
+TARGETS_JSON = Path(r"C:\bot\tools\cfg\not_full.json")
+OUTPUT_DIR = Path(r"C:\bot\характеристики2")
+DEBUG_DIR = Path(r"C:\bot\характеристики2_debug")
+
+# ----------- ПАРАМЕТРЫ ДЕТЕКТА -----------
+# Цветные разделители: RGB(225,225,225)±tolerance
+SEPARATOR_RGB = 225
+SEPARATOR_TOL = 14     # допуск по каждому каналу
+ROW_COVER_FRAC = 0.65  # какая доля строки должна быть "серой", чтобы считать её разделителем
+MIN_BAND_PX = 1        # мин. толщина полосы, чтобы учитывать её как разделитель
+TITLE_SLICE_FRAC = 0.26  # верхняя часть блока для OCR (доля высоты блока)
+TITLE_SLICE_MAX = 160     # максимальная высота зоны названия (px)
+TITLE_SLICE_MIN = 32      # минимальная высота зоны названия (px)
+
+
+# ----------- Unicode-safe IO -----------
+def imread_u(path: Path):
+    data = np.fromfile(str(path), dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return img
+
+
+def imwrite_u(path: Path, img):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise IOError(f"Failed to encode for write: {path}")
+    with open(path, "wb") as f:
+        buf.tofile(f)
+    return True
+
+
+# ----------- Нормализация и ключи -----------
+def norm_text_key(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s)).lower()
+    s = s.replace("ё", "е")
+    # оставить буквы/цифры/пробел/подчёркивание/дефис
+    s = re.sub(r"[^0-9a-zа-яё _\-]", " ", s)
+    # дефисы и пробелы -> "_"
+    s = s.replace("-", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace(" ", "_")
+    s = re.sub(r"_+", "_", s)
+    return s
+
+
+def normalize_filename(name: str) -> str:
+    # безопасное имя, не трогаем подчёркивания/кириллицу
+    bad = '<>:"/\\|?*'
+    out = []
+    for ch in unicodedata.normalize("NFC", name):
+        out.append("_" if ch in bad else ch)
+    s = "".join(out).strip()
+    return s or "unnamed"
+
+
+# ----------- Загрузка таргетов -----------
+def load_targets_list(json_path: Path):
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("not_full.json должен быть МАССИВОМ строк")
+    # карта норм-ключ -> оригинал
+    mapping = {}
+    for raw in data:
+        if not isinstance(raw, str):
+            continue
+        k = norm_text_key(raw)
+        if not k:
+            continue
+        # если дубли по ключу — оставляем первый
+        mapping.setdefault(k, raw)
+    return mapping
+
+
+# ----------- Поиск горизонтальных разделителей -----------
+def find_separator_y_positions(img_bgr: np.ndarray):
+    """
+    Ищем горизонтальные линии ~RGB(225,225,225): строки, где
+    доля пикселей близких к 225 по всем каналам >= ROW_COVER_FRAC.
+    Возвращаем список Y (центры полос).
+    """
+    H, W = img_bgr.shape[:2]
+    b, g, r = cv2.split(img_bgr)
+    # маска "близко к 225 по всем каналам"
+    m_b = np.abs(b.astype(np.int16) - SEPARATOR_RGB) <= SEPARATOR_TOL
+    m_g = np.abs(g.astype(np.int16) - SEPARATOR_RGB) <= SEPARATOR_TOL
+    m_r = np.abs(r.astype(np.int16) - SEPARATOR_RGB) <= SEPARATOR_TOL
+    m_all = (m_b & m_g & m_r).astype(np.uint8)
+
+    # доля "серых" по каждой строке
+    row_frac = m_all.sum(axis=1) / float(W)
+
+    # бинаризация по порогу покрытия
+    rows_bin = (row_frac >= ROW_COVER_FRAC).astype(np.uint8)
+
+    # группируем подряд идущие "1"
+    ys = []
+    in_band = False
+    start = 0
+    for y in range(H):
+        if rows_bin[y] and not in_band:
+            in_band = True
+            start = y
+        elif not rows_bin[y] and in_band:
+            in_band = False
+            end = y
+            if (end - start) >= MIN_BAND_PX:
+                ys.append((start + end) // 2)
+    if in_band:
+        end = H - 1
+        if (end - start) >= MIN_BAND_PX:
+            ys.append((start + end) // 2)
+
+    # удаляем слишком близкие дубликаты (дребезг)
+    ys = sorted(ys)
+    dedup = []
+    for y in ys:
+        if not dedup or abs(y - dedup[-1]) > 2:
+            dedup.append(y)
+    return dedup
+
+
+def blocks_from_separators(H: int, sep_ys: list):
+    """
+    Строим блоки между разделителями. У первого блока нет верхней линии, у последнего нет нижней.
+    Всегда добавляем 0 и H как границы.
+    """
+    cuts = [0] + sep_ys + [H]
+    blocks = []
+    for i in range(len(cuts) - 1):
+        y0, y1 = cuts[i], cuts[i + 1]
+        if y1 - y0 >= 12:  # отсечь мусорные тонкие
+            blocks.append((y0, y1))
+    return blocks
+
+
+# ----------- OCR названия (верхняя часть блока) -----------
+def ocr_block_title(img_bgr: np.ndarray):
+    if pytesseract is None:
+        return ""
+    H, W = img_bgr.shape[:2]
+    # зону названия берём сверху блока
+    h_title = int(max(TITLE_SLICE_MIN, min(TITLE_SLICE_MAX, TITLE_SLICE_FRAC * H)))
+    roi = img_bgr[0:h_title, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # лёгкое улучшение контраста
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    # бинаризация ближе к тексту
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # иногда текст темнее — инверсия может помочь
+    if np.mean(bw) > 127:
+        bw = 255 - bw
+
+    txt = pytesseract.image_to_string(bw, lang="rus", config="--oem 3 --psm 6")
+    # берём наиболее правдоподобную строку из первых
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    # в названии обычно мало слов — выберем самую информативную из первых 3
+    top = lines[:3]
+    top.sort(key=len, reverse=True)
+    return top[0]
+
+
+# ----------- Основной процесс -----------
+def process_one_image(img_path: Path, targets_map: dict):
+    img = imread_u(img_path)
+    if img is None:
+        print(f"[MISS] imread: {img_path.name}")
+        return {"saved": 0}
+
+    H, W = img.shape[:2]
+    sep_ys = find_separator_y_positions(img)
+    blocks = blocks_from_separators(H, sep_ys)
+    overlay = img.copy()
+
+    saved = 0
+    matched_in_image = set()  # чтобы не сохранять один и тот же таргет дважды в одном изображении
+
+    for (y0, y1) in blocks:
+        block = img[y0:y1, :]
+
+        title_raw = ocr_block_title(block)
+        key = norm_text_key(title_raw)
+
+        # быстрые варианты: если OCR дал пусто — попробуем захватить побольше (fallback)
+        if not key and pytesseract is not None:
+            # расширим до 40% высоты блока в качестве фола
+            h_fallback = int(min(max(int(0.4 * (y1 - y0)), TITLE_SLICE_MIN), TITLE_SLICE_MAX * 2))
+            roi_fb = img[y0:y0 + min(h_fallback, y1 - y0), :]
+            title_raw_fb = ocr_block_title(roi_fb)
+            key = norm_text_key(title_raw_fb)
+
+        color = (0, 0, 255)
+        label = key or "?"
+
+        if key in targets_map and key not in matched_in_image:
+            orig_name = targets_map[key]  # из JSON
+            save_name = f"{normalize_filename(orig_name)}_full.png"
+            save_path = OUTPUT_DIR / save_name
+            imwrite_u(save_path, block)
+            saved += 1
+            matched_in_image.add(key)
+            color = (0, 200, 0)
+            label = f"{orig_name}"
+
+        # оверлей
+        cv2.rectangle(overlay, (0, y0), (W - 1, y1), color, 2)
+        cv2.putText(overlay, label[:48], (6, max(18, y0 + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+    # нарисуем линий-разделители
+    for y in sep_ys:
+        cv2.line(overlay, (0, y), (W - 1, y), (255, 0, 0), 1)
+
+    imwrite_u(DEBUG_DIR / f"{img_path.stem}__overlay.png", overlay)
+    print(f"[OK] {img_path.name}: blocks={len(blocks)} saved={saved} separators={len(sep_ys)}")
+    return {"saved": saved, "blocks": len(blocks), "seps": len(sep_ys)}
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Загружаем таргеты
+    targets_map = load_targets_list(TARGETS_JSON)
+    if not targets_map:
+        print("[ERR] Пустой список целей в not_full.json")
+        return
+
+    # Сканируем вход
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+    sources = [p for p in sorted(INPUT_DIR.rglob("*")) if p.suffix.lower() in exts]
+    if not sources:
+        print(f"[ERR] Нет изображений в {INPUT_DIR}")
+        return
+
+    total_saved = 0
+    total_blocks = 0
+    for p in sources:
+        info = process_one_image(p, targets_map)
+        total_saved += info.get("saved", 0)
+        total_blocks += info.get("blocks", 0) if "blocks" in info else 0
+
+    print(f"[DONE] files={len(sources)} blocks={total_blocks} saved={total_saved} out={OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

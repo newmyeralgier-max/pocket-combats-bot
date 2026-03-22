@@ -1,0 +1,564 @@
+import datetime
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+BASE_DIR = "C:/bot"
+SCREENS_DIR = os.path.join(BASE_DIR, "screens")
+OUT_DIR = os.path.join(BASE_DIR, "out")
+DEBUG_DIR = os.path.join(BASE_DIR, "_debug")
+TPL_DIR_MY = os.path.join(BASE_DIR, "tpl", "my")
+TPL_CHEVRONS_DIR = os.path.join(BASE_DIR, "tpl", "chevrons")
+LOG_DIR = os.path.join(BASE_DIR, "log")
+CFG_DIR = os.path.join(BASE_DIR, "cfg")
+CFG_FILE = os.path.join(CFG_DIR, "config.json")
+LOG_FILE = os.path.join(LOG_DIR, "run_log.txt")
+os.makedirs(SCREENS_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CFG_DIR, exist_ok=True)
+DEFAULT_CFG: Dict[str, Any] = {
+    "device_id": None,
+    "dry_run": False,
+    "sleep_after_tap": 0.65,
+    "max_tab_attempts": 2,
+    "item_name_threshold": 0.86,
+    "item_scales": [0.95, 1.0, 1.05],
+    "max_lines_to_collect": 6,
+    "pickup_rel": [0.72, 0.83, 0.95, 0.94],
+    "color_ratio_threshold": 0.12,
+    "safe_x1": 0,
+    "safe_x2": 1080,
+    "safe_y1": 400,
+    "safe_y2": 2100,
+    "max_swipe_attempts": 3,
+    "save_debug_images": True,
+}
+
+
+def now_ts() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f")[:-3]
+
+
+def log(msg: str):
+    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except:
+        pass
+
+
+def load_config() -> Dict[str, Any]:
+    cfg = DEFAULT_CFG.copy()
+    if os.path.isfile(CFG_FILE):
+        try:
+            user = json.load(open(CFG_FILE, "r", encoding="utf-8"))
+            for k, v in user.items():
+                cfg[k] = v
+            log(f"[CFG] Загружен tools/tools/tools/tools/tools/tools/tools/cfg/config.json")
+        except Exception as e:
+            log(f"[CFG] Не удалось прочитать config.json: {e} — используем дефолт")
+    else:
+        try:
+            with open(CFG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CFG, f, ensure_ascii=False, indent=2)
+            log("[CFG] Сохранён дефолтный config.json (можно править ROI/тайминги)")
+        except Exception as e:
+            log(f"[CFG] Не удалось сохранить дефолтный config.json: {e}")
+    return cfg
+
+
+CFG = load_config()
+DEVICE_ID: Optional[str] = CFG["device_id"]
+DRY_RUN = bool(CFG["dry_run"])
+SLEEP_AFTER_TAP = float(CFG["sleep_after_tap"])
+MAX_TAB_ATTEMPTS = int(CFG["max_tab_attempts"])
+ITEM_NAME_THRESHOLD = float(CFG["item_name_threshold"])
+ITEM_SCALES = list(CFG["item_scales"])
+MAX_LINES_TO_COLLECT = int(CFG["max_lines_to_collect"])
+PICKUP_REL = tuple(CFG["pickup_rel"])
+COLOR_RATIO_THRESHOLD = float(CFG["color_ratio_threshold"])
+SAFE_X1, SAFE_X2 = int(CFG["safe_x1"]), int(CFG["safe_x2"])
+SAFE_Y1, SAFE_Y2 = int(CFG["safe_y1"]), int(CFG["safe_y2"])
+MAX_SWIPE_ATTEMPTS = int(CFG["max_swipe_attempts"])
+SAVE_DEBUG_IMAGES = bool(CFG["save_debug_images"])
+
+
+def adb_cmd(args: List[str], timeout: float = 5.0) -> subprocess.CompletedProcess:
+    base = ["adb"]
+    if DEVICE_ID:
+        base = ["adb", "-s", DEVICE_ID]
+    return subprocess.run(base + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+
+def screenshot_bgr() -> np.ndarray:
+    try:
+        proc = adb_cmd(["exec-out", "screencap", "-p"], timeout=15.0)
+    except subprocess.TimeoutExpired:
+        log("[WARN] Скриншот не получен за 15с — повторная попытка")
+        proc = adb_cmd(["exec-out", "screencap", "-p"], timeout=15.0)
+    data = proc.stdout
+    if not data:
+        raise RuntimeError("Пустой скриншот")
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError("Не удалось декодировать PNG скриншот")
+    if SAVE_DEBUG_IMAGES:
+        cv2.imwrite(os.path.join(DEBUG_DIR, f"raw_{now_ts()}.png"), img)
+    return img
+
+
+def save_debug(img: np.ndarray, name: str):
+    if not SAVE_DEBUG_IMAGES:
+        return
+    cv2.imwrite(os.path.join(DEBUG_DIR, name), img)
+
+
+def _draw_rect(img, rect, color=(0, 255, 0), thick=2):
+    x, y, w, h = rect
+    cv2.rectangle(img, (x, y), (x + w, y + h), color, thick)
+
+
+def _draw_point(img, pt, color=(0, 0, 255), r=8, thick=2):
+    x, y = pt
+    cv2.circle(img, (int(x), int(y)), r, color, thick)
+
+
+def snap(
+    label: str,
+    frame: np.ndarray,
+    rects: List[Tuple[int, int, int, int]] = None,
+    rect_colors: List[Tuple[int, int, int]] = None,
+    points: List[Tuple[int, int]] = None,
+    point_colors: List[Tuple[int, int, int]] = None,
+):
+    if not SAVE_DEBUG_IMAGES:
+        return
+    img = frame.copy()
+    rects = rects or []
+    rect_colors = rect_colors or []
+    points = points or []
+    point_colors = point_colors or []
+    while len(rect_colors) < len(rects):
+        rect_colors.append((0, 255, 0))
+    while len(point_colors) < len(points):
+        point_colors.append((0, 0, 255))
+    for r, c in zip(rects, rect_colors):
+        _draw_rect(img, r, c, 2)
+    for p, c in zip(points, point_colors):
+        _draw_point(img, p, c, 8, 2)
+    name = f"annot_{label}_{now_ts()}.png"
+    cv2.imwrite(os.path.join(DEBUG_DIR, name), img)
+
+
+def snap_roi(label: str, roi: np.ndarray, at_rect: Tuple[int, int, int, int]):
+    if not SAVE_DEBUG_IMAGES:
+        return
+    x, y, w, h = at_rect
+    tag = f"{label}_x{x}_y{y}_w{w}_h{h}_{now_ts()}.png"
+    cv2.imwrite(os.path.join(DEBUG_DIR, f"pickup_roi_{tag}"), roi)
+
+
+def imread_u8(path: str, flags: int = cv2.IMREAD_COLOR):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(arr, flags)
+    except Exception as e:
+        log(f"[IMG] read fail: {path} // {e}")
+        return None
+
+
+def tap(x: int, y: int, reason: str = ""):
+    x = max(SAFE_X1, min(SAFE_X2, int(x)))
+    y = max(SAFE_Y1, min(SAFE_Y2, int(y)))
+    if DRY_RUN:
+        log(f"DRY_RUN TAP at ({x},{y}){'  // ' + reason if reason else ''}")
+        return
+    adb_cmd(["shell", "input", "tap", str(x), str(y)])
+    log(f"TAP at ({x},{y}){'  // ' + reason if reason else ''}")
+    time.sleep(SLEEP_AFTER_TAP)
+
+
+def swipe_mid_down(duration_ms: int = 260):
+    try:
+        frame = screenshot_bgr()
+        H, W = frame.shape[:2]
+    except:
+        W, H = 1080, 2460
+    x = W // 2
+    y1, y2 = min(SAFE_Y2, 1900), max(SAFE_Y1, 1400)
+    adb_cmd(["shell", "input", "swipe", str(x), str(y1), str(x), str(y2), str(duration_ms)])
+    log("[SCROLL] swipe down to reveal pickup button")
+    time.sleep(0.5)
+
+
+def to_gray(img: np.ndarray) -> np.ndarray:
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    g = cv2.bilateralFilter(g, 5, 35, 35)
+    g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+    return g
+
+
+def _scharr_mag(gray: np.ndarray) -> np.ndarray:
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    return cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def match_scaled(
+    gray_img: np.ndarray, tpl_gray_full: np.ndarray, threshold: float, scales: List[float]
+) -> Tuple[bool, float, Tuple[int, int, int, int]]:
+    best_ok = False
+    best_score = 0.0
+    best_box = 0, 0, 0, 0
+    th, tw = tpl_gray_full.shape[:2]
+    H, W = gray_img.shape[:2]
+    for s in scales:
+        tws, ths = max(5, int(tw * s)), max(5, int(th * s))
+        if H < ths or W < tws:
+            continue
+        tpl_gray = cv2.resize(tpl_gray_full, (tws, ths), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_CUBIC)
+        res = cv2.matchTemplate(gray_img, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val > best_score:
+            best_score = float(max_val)
+            best_ok = best_score >= threshold
+            best_box = int(max_loc[0]), int(max_loc[1]), int(tws), int(ths)
+    return best_ok, best_score, best_box
+
+
+sys.path.append(os.path.join(BASE_DIR, "lib"))
+from tab_detector import detect_tab_states
+
+SKIP_FILES = {
+    "monsters_tab.png",
+    "items_tab.png",
+    "open_tab.png",
+    "close_tab.png",
+    "pickup.png",
+    "pickup_own.png",
+    "pickup own.png",
+    "pickup_other.png",
+    "syschat.png",
+    "start.png",
+    "start.PNG",
+    "items_hdr.png",
+    "items_label.png",
+}
+
+
+def load_item_name_templates():
+    tpls = []
+    for p in sorted(glob.glob(ui_tpl_path("*.png"))):
+        base = os.path.basename(p)
+        if base in SKIP_FILES:
+            continue
+        img = imread_u8(p, cv2.IMREAD_COLOR)
+        if img is not None:
+            tpls.append((base, img))
+        else:
+            log(f"[TPL] not readable: {p}")
+    return tpls
+
+
+def merge_same_lines(boxes_scores, line_thr=75):
+    if not boxes_scores:
+        return []
+    centers = []
+    for i, ((x, y, w, h), s, name) in enumerate(boxes_scores):
+        cy = y + h // 2
+        centers.append((cy, i))
+    centers.sort()
+    groups, current = [], [centers[0][1]]
+    last_cy = centers[0][0]
+    for cy, idx in centers[1:]:
+        if abs(cy - last_cy) <= line_thr:
+            current.append(idx)
+        else:
+            groups.append(current)
+            current = [idx]
+        last_cy = cy
+    groups.append(current)
+    keep_idxs = [max(g, key=lambda i: boxes_scores[i][1]) for g in groups]
+    return keep_idxs
+
+
+def find_item_names(frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    H, W = frame_bgr.shape[:2]
+    x1, x2 = 0, 500
+    y1, y2 = SAFE_Y1, SAFE_Y2
+    crop = frame_bgr[y1:y2, x1:x2]
+    gray = to_gray(crop)
+    boxes_scores = []
+    tpls = load_item_name_templates()
+    for name, tpl in tpls:
+        ok, score, (x, y, w, h) = match_scaled(gray, to_gray(tpl), ITEM_NAME_THRESHOLD, ITEM_SCALES)
+        if ok:
+            boxes_scores.append(((x, y, w, h), score, name))
+    if not boxes_scores:
+        gg = _scharr_mag(gray)
+        for name, tpl in tpls:
+            tg = _scharr_mag(to_gray(tpl))
+            ok, score, (x, y, w, h) = match_scaled(gg, tg, 0.83, ITEM_SCALES)
+            if ok:
+                boxes_scores.append(((x, y, w, h), score, name))
+    log(f"[ITEMS] найдено совпадений: {len(boxes_scores)} в ROI=[{x1},{y1},{x2},{y2}] до группировки")
+    keep = merge_same_lines(boxes_scores, line_thr=75)
+    if len(keep) > MAX_LINES_TO_COLLECT:
+        keep = sorted(keep, key=lambda i: boxes_scores[i][0][1])[:MAX_LINES_TO_COLLECT]
+    rects_abs = []
+    found = []
+    for i in keep:
+        (x, y, w, h), score, name = boxes_scores[i]
+        ax, ay = x1 + x, y1 + y
+        rects_abs.append((ax, ay, w, h))
+        found.append({"name": name, "score": float(score), "center": (ax + w // 2, ay + h // 2), "box": (ax, ay, w, h)})
+    try:
+        snap("items", frame_bgr, rects=rects_abs)
+    except:
+        pass
+    log(f"[ITEMS] строк после группировки: {len(found)} (шаг≈150, порог=75)")
+    return found
+
+
+def rect_from_rel(w: int, h: int, rel: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+    x1r, y1r, x2r, y2r = rel
+    ax1, ay1, ax2, ay2 = int(w * x1r), int(h * y1r), int(w * x2r), int(h * y2r)
+    return ax1, ay1, ax2, ay2
+
+
+def _tpl(path: str) -> Optional[np.ndarray]:
+    if not path:
+        return None
+    return imread_u8(path, cv2.IMREAD_COLOR)
+
+
+def pickup_state(frame_bgr: np.ndarray) -> Dict[str, Any]:
+    """
+    Возвращает:
+    {
+      "state": "active" | "inactive" | "out_of_view",
+      "score": float|None,
+      "method": "tpl" | "color" | "out_of_view",
+      "box": (x,y,w,h) | None,   # абсолютный бокс кнопки
+      "roi_rect": (x,y,w,h)      # абсолютный ROI кнопки (для отладки)
+    }
+    """
+    H, W = frame_bgr.shape[:2]
+    gray_full = to_gray(frame_bgr)
+    active_main = _tpl(ui_tpl_path("pickup.png"))
+    active_own = _tpl(ui_tpl_path("pickup_own.png"))
+    if active_own is None:
+        active_own = _tpl(ui_tpl_path("pickup own.png"))
+    inactive = _tpl(ui_tpl_path("pickup_other.png"))
+    best = {"state": None, "score": None, "box": None, "method": None}
+
+    def try_one(tpl_bgr: Optional[np.ndarray], label: str, cur_best: Dict[str, Any]):
+        if tpl_bgr is None:
+            return cur_best
+        ok, sc, (x, y, w, h) = match_scaled(gray_full, to_gray(tpl_bgr), 0.86, [0.9, 0.95, 1.0, 1.05])
+        if ok and (cur_best["score"] is None or sc > cur_best["score"]):
+            cur_best = {"state": label, "score": float(sc), "box": (x, y, w, h), "method": "tpl"}
+        return cur_best
+
+    best = try_one(active_main, "active", best)
+    best = try_one(active_own, "active", best)
+    best = try_one(inactive, "inactive", best)
+    rx1, ry1, rx2, ry2 = rect_from_rel(W, H, PICKUP_REL)
+    roi_rect = rx1, ry1, max(1, rx2 - rx1), max(1, ry2 - ry1)
+    roi = frame_bgr[ry1:ry2, rx1:rx2]
+    try:
+        if best["box"] is not None:
+            snap("pickup_tpl", frame_bgr, rects=[best["box"]], rect_colors=[(255, 165, 0)])
+        snap("pickup_roi", frame_bgr, rects=[roi_rect], rect_colors=[(0, 200, 255)])
+        snap_roi("pickup_roi", roi, roi_rect)
+    except:
+        pass
+    if best["state"] is not None:
+        best["roi_rect"] = roi_rect
+        return best
+    if roi.size == 0:
+        log("[PICKUP] ROI пуст — кнопка вне экрана (out_of_view)")
+        return {"state": "out_of_view", "score": None, "box": None, "method": "out_of_view", "roi_rect": roi_rect}
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = (hsv[:, :, (1)] > 90) & (hsv[:, :, (2)] > 160)
+    ratio = float(mask.sum()) / float(max(1, mask.size))
+    state = "active" if ratio >= COLOR_RATIO_THRESHOLD else "inactive"
+    log(f"[PICKUP] color ratio={ratio:.3f} -> {state}")
+    return {"state": state, "score": ratio, "box": None, "method": "color", "roi_rect": roi_rect}
+
+
+def collapse_item_panel(last_click_xy: Tuple[int, int]):
+    x, y = last_click_xy
+    tap(x, y, reason="collapse_item_panel")
+    time.sleep(0.35)
+
+
+def ensure_tab_state(tab_label: str, target_state: str) -> bool:
+    """
+    Приводит вкладку tab_label к состоянию target_state.
+    Порядок: клики по лейблу (разные смещения) -> полоса -> шеврон.
+    После каждого шага — проверка и ранний выход.
+    """
+
+    def wait_and_check() -> bool:
+        time.sleep(0.8)
+        st = detect_tab_states(screenshot_bgr())[tab_label]["state"]
+        return st == target_state
+
+    frame = screenshot_bgr()
+    cur = detect_tab_states(frame)[tab_label]
+    log(
+        f"[TAB:{tab_label}] state={cur['state']} label_found={int(cur['label_found'])} lbl={cur['scores']['label']:.3f} up={cur['scores']['up']:.3f} dn={cur['scores']['down']:.3f} band_y={cur['band_y']}"
+    )
+    if cur["state"] == target_state:
+        return True
+    if cur["label_found"] and cur["label_box"]:
+        lx, ly, lw, lh = cur["label_box"]
+        for frac in (0.5, 0.7, 0.3):
+            cx = int(lx + lw * frac)
+            cy = int(ly + lh * 0.5)
+            tap(cx, cy, reason=f"{tab_label}:label_frac={frac:.1f} -> toggle")
+            if wait_and_check():
+                return True
+    band_y = int(cur["band_y"])
+    tap(180, band_y, reason=f"{tab_label}:band_line -> toggle")
+    if wait_and_check():
+        return True
+    for cx in (1050, 950):
+        tap(cx, band_y, reason=f"{tab_label}:chevron -> toggle")
+        if wait_and_check():
+            return True
+    log(f"[WARN] {tab_label}: state не меняется после label/band/chevron — пропускаем")
+    return False
+
+
+def auto_loot_once():
+    log("=== AUTO-LOOT START (steps 8–12) ===")
+    frame0 = screenshot_bgr()
+    st = detect_tab_states(frame0)
+    if st["монстры"]["state"] == "открыта":
+        ensure_tab_state("монстры", "закрыта")
+    ensure_tab_state("вещи", "открыта")
+    frame = screenshot_bgr()
+    items = find_item_names(frame)
+    if not items:
+        log("[FLOW] В списке нет предметов")
+        log("=== AUTO-LOOT END ===")
+        return
+    items.sort(key=lambda d: d["box"][1])
+    for it in items:
+        name = it["name"]
+        cx, cy = it["center"]
+        log(f"[ITEM] click '{name}' at ({cx}, {cy}) score={it['score']:.3f}")
+        try:
+            snap("click_item", frame, points=[(cx, cy)])
+        except:
+            pass
+        tap(cx, cy, reason="open_item_card")
+        time.sleep(0.45)
+        success = False
+        for attempt in range(1 + MAX_SWIPE_ATTEMPTS):
+            frame2 = screenshot_bgr()
+            ps = pickup_state(frame2)
+            state, score, box, method, roi_rect = ps["state"], ps["score"], ps["box"], ps["method"], ps["roi_rect"]
+            log(f"[PICKUP] attempt={attempt} state={state} score={score} method={method}")
+            if state == "out_of_view":
+                swipe_mid_down()
+                continue
+            if state == "inactive":
+                log(f"[FLOW] Первая неактивная кнопка у '{name}' — сворачиваем и завершаем лут")
+                collapse_item_panel((cx, cy))
+                time.sleep(0.25)
+                ensure_tab_state("вещи", "закрыта")
+                log("=== AUTO-LOOT END ===")
+                return
+            if state == "active":
+                if box is not None:
+                    bx = box[0] + box[2] // 2
+                    by = box[1] + box[3] // 2
+                else:
+                    rx, ry, rw, rh = roi_rect
+                    bx = rx + rw // 2
+                    by = ry + rh // 2
+                try:
+                    snap(
+                        "pickup_click",
+                        frame2,
+                        rects=[box] if box else [roi_rect],
+                        rect_colors=[(0, 255, 0)],
+                        points=[(bx, by)],
+                    )
+                except:
+                    pass
+                tap(bx, by, reason="pickup")
+                time.sleep(1.0)
+                frame3 = screenshot_bgr()
+                try:
+                    sub_items = find_item_names(frame3)
+                    vanished = not any(si["name"] == name for si in sub_items)
+                except Exception as e:
+                    log(f"[VERIFY] повторный поиск имён дал ошибку: {e}")
+                    vanished = False
+                if vanished:
+                    log(f"[FLOW] '{name}' подобран — карточка исчезла")
+                    collapse_item_panel((cx, cy))
+                    time.sleep(0.25)
+                    success = True
+                    break
+                else:
+                    log(f"[WARN] '{name}' не исчез — повторная попытка нажать")
+                    tap(bx, by, reason="pickup_retry")
+                    time.sleep(1.0)
+                    frame4 = screenshot_bgr()
+                    try:
+                        sub_items2 = find_item_names(frame4)
+                        vanished2 = not any(si["name"] == name for si in sub_items2)
+                    except Exception as e:
+                        log(f"[VERIFY] повторный поиск имён #2 дал ошибку: {e}")
+                        vanished2 = False
+                    if vanished2:
+                        log(f"[FLOW] '{name}' подобран со второй попытки")
+                        collapse_item_panel((cx, cy))
+                        time.sleep(0.25)
+                        success = True
+                        break
+                    else:
+                        log(f"[FLOW] '{name}' не удалось подобрать на attempt={attempt}")
+                        if attempt < MAX_SWIPE_ATTEMPTS:
+                            swipe_mid_down()
+                            continue
+                        else:
+                            collapse_item_panel((cx, cy))
+                            break
+        if not success:
+            log(f"[FLOW] Переходим к следующему предмету после неудачи с '{name}'")
+    ensure_tab_state("вещи", "закрыта")
+    log("=== AUTO-LOOT END ===")
+
+
+def main():
+    try:
+        adb_cmd(["get-state"])
+    except Exception as e:
+        log(f"ADB недоступен: {e}")
+        return
+    auto_loot_once()
+
+
+if __name__ == "__main__":
+    main()

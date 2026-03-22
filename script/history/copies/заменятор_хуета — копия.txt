@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Единый заменятор путей для проекта.
+
+Ключевые особенности:
+ - Полные пары old/new с детерминированной сборкой правил замены.
+ - Нормализация, генерация вариантов (/, \, регистр, удаление /tpl при необходимости).
+ - Поиск в прямых строках, f-строках, конкатенациях, и внутри os.path.join(...), включая многострочные вызовы.
+ - Явные исключения (например, close, служебные) — строка пропускается, логируется причина.
+ - Dry-run режим, пер-файл бэкапы, атомарная запись, пер-строчный лог: [OK], [SKIP], [MISS].
+ - Дедупликатор правил, при конфликте — лог [MISS] с описанием.
+ - Детерминированный порядок обхода файлов и применения правил (сортировка по длине литерала, убывание).
+ - Расширенные диагностические отчёты и итоговая статистика.
+
+Ограничения:
+ - Замена ориентирована на точные подстроки путей и их очевидные текстовые варианты.
+ - Нестандартные шаблонизаторы/DSL вне string/join могут потребовать расширения.
+
+Настройки под проект в секции "НАСТРОЙКИ".
+"""
+
+import datetime as _dt
+import hashlib
+import io
+import os
+import re
+import shutil
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+# === НАСТРОЙКИ ===
+
+# Корень проекта (где вести поиск файлов)
+PROJECT_ROOT = Path(r"C:\bot")
+
+# Списки путей: один-в-один идущие строки OLD -> NEW
+OLD_LIST_FILE = "old_file_list.txt"
+NEW_LIST_FILE = "new_file_list.txt"
+
+# Исключения: строки/пути, которые нельзя трогать (по вхождению, re.IGNORECASE)
+EXCLUDE_PATTERNS = [
+    r"close",
+    r"служебные",
+]
+
+# Расширения, в которых ищем/заменяем
+TARGET_EXTENSIONS = (
+    ".py", ".txt", ".cfg", ".ini", ".json", ".yaml", ".yml",
+)
+
+# Лог, режимы
+LOG_FILE = "replace_log.txt"
+DRY_RUN = True      # True: не записывает изменения, только лог
+BACKUP = True       # True: делает резервную копию изменённого файла
+BACKUP_DIR = "_backups"  # Директория бэкапов (создаётся в PROJECT_ROOT)
+
+# Ограничения безопасности записи
+ATOMIC_WRITE = True  # Запись через временный файл и atomic replace
+
+# === ГЛОБАЛЬНЫЕ СТАТЫ ===
+STATS = {
+    "files_scanned": 0,
+    "files_changed": 0,
+    "ok": 0,
+    "skip": 0,
+    "miss": 0,
+    "conflicts": 0,
+}
+
+# === УТИЛИТЫ НОРМАЛИЗАЦИИ ===
+
+def normalize_text(s: str) -> str:
+    """
+    Базовая нормализация:
+     - NFKC
+     - слэши -> /
+     - lower
+    """
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\\", "/")
+    return s.lower()
+
+def normalize_name(name: str) -> str:
+    """
+    Доп. нормализация имени/пути:
+     - лат -> кир для известных синонимов (пример)
+     - удаление суффиксов _\d+ в конце сегмента
+    """
+    name = normalize_text(name)
+    name = name.replace("yantar", "янтарь")
+    name = re.sub(r"_(\d+)$", "", name)
+    return name
+
+def gen_variants(path: str) -> Set[str]:
+    """
+    Генерирует набор текстовых вариантов для поиска:
+     - прямой и обратный слэш
+     - с /tpl и без /tpl (на случай относительных упоминаний)
+     - без _name
+    """
+    variants: Set[str] = set()
+    base = normalize_text(path)  # слэши -> /, lower
+
+    variants.add(base)  # / слэши
+    variants.add(base.replace("/", "\\"))  # \ слэши
+
+    if "/tpl" in base:
+        stripped = base.replace("/tpl", "")
+        if stripped:
+            variants.add(stripped)
+            variants.add(stripped.replace("/", "\\"))
+
+    no_name = re.sub(r"_name\b", "", base)
+    variants.add(no_name)
+    variants.add(no_name.replace("/", "\\"))
+
+    return {v for v in variants if v}
+
+def is_excluded(text: str) -> bool:
+    """
+    Проверка строки/контента по исключениям.
+    """
+    for pat in EXCLUDE_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
+
+def rel(p: Path) -> str:
+    """
+    Относительный путь для логов, относительно PROJECT_ROOT (если возможно).
+    """
+    try:
+        return str(p.resolve().relative_to(PROJECT_ROOT.resolve()))
+    except Exception:
+        return str(p)
+
+def now_stamp() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+import re
+
+
+def safe_replace(content, old_path, new_path):
+    # Экранируем старый путь, чтобы спецсимволы не ломали regex
+    pattern = re.escape(old_path)
+    # Замена через lambda, чтобы не было "bad escape"
+    return re.sub(pattern, lambda m: new_path, content)
+
+# Пример использования
+old = r"bot\tpl\close\file.txt"
+new = r"bot/tpl/close/file.txt"
+
+text = 'path = "bot\\tpl\\close\\file.txt"'
+print(safe_replace(text, old, new))
+
+def sha1_text(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+def sha1_file(p: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha1()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+# === ЛОГИРОВАНИЕ ===
+
+def init_log():
+    if os.path.exists(LOG_FILE):
+        os.remove(LOG_FILE)
+    header = f"=== REPLACE RUN {now_stamp()} ===\n" \
+             f"ROOT: {PROJECT_ROOT}\n" \
+             f"DRY_RUN={DRY_RUN} BACKUP={BACKUP} ATOMIC_WRITE={ATOMIC_WRITE}\n\n"
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write(header)
+
+def log_action(status: str, file_path: str, line_num: int = None,
+               old: str = None, new: str = None, line: str = None, reason: str = None):
+    """
+    Унифицированный логгер.
+    """
+    if status == "OK":
+        STATS["ok"] += 1
+    elif status == "SKIP":
+        STATS["skip"] += 1
+    elif status == "MISS":
+        STATS["miss"] += 1
+
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        if status == "OK":
+            f.write(f"[OK] {file_path}:{line_num if line_num else ''}\n")
+            if old is not None: f.write(f"OLD: {old}\n")
+            if new is not None: f.write(f"NEW: {new}\n")
+            if line is not None: f.write(f"LINE: {line}\n")
+            f.write("\n")
+        elif status == "SKIP":
+            f.write(f"[SKIP] {file_path}:{line_num if line_num else ''}")
+            if reason: f.write(f" — {reason}")
+            f.write("\n")
+            if line: f.write(f"LINE: {line}\n\n")
+        elif status == "MISS":
+            f.write(f"[MISS] {file_path}")
+            if reason: f.write(f" — {reason}")
+            f.write("\n\n")
+
+def log_summary():
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write("\n=== SUMMARY ===\n")
+        for k in ["files_scanned", "files_changed", "ok", "skip", "miss", "conflicts"]:
+            f.write(f"{k}: {STATS[k]}\n")
+
+# === ЧТЕНИЕ ПАР ===
+
+def load_pairs() -> List[Tuple[str, str]]:
+    """
+    Загружает списки OLD/NEW из файлов и склеивает попарно по минимальной длине.
+    Лишние строки логируются как [SKIP]/[MISS].
+    """
+    try:
+        with open(OLD_LIST_FILE, encoding="utf-8") as f:
+            old_paths = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        old_paths = []
+        log_action("MISS", f"{OLD_LIST_FILE}", reason="Не найден OLD_LIST_FILE")
+
+    try:
+        with open(NEW_LIST_FILE, encoding="utf-8") as f:
+            new_paths = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        new_paths = []
+        log_action("MISS", f"{NEW_LIST_FILE}", reason="Не найден NEW_LIST_FILE")
+
+    min_len = min(len(old_paths), len(new_paths))
+    pairs = list(zip(old_paths[:min_len], new_paths[:min_len]))
+
+    if len(old_paths) != len(new_paths):
+        log_action("MISS", "-", reason=f"Разная длина списков: old={len(old_paths)}, new={len(new_paths)}")
+        if len(old_paths) > min_len:
+            for extra in old_paths[min_len:]:
+                log_action("SKIP", extra, reason="OLD без пары")
+        if len(new_paths) > min_len:
+            for extra in new_paths[min_len:]:
+                log_action("SKIP", extra, reason="NEW без пары")
+
+    return pairs
+
+# === ПОСТРОЕНИЕ ПРАВИЛ ===
+
+class Replacement:
+    """
+    Описывает одно правило замены:
+     - pattern: скомпилированный regex для поиска (case-insensitive)
+     - literal_norm: нормализованный литерал (lower + /), для быстрых проверок
+     - new_norm: нормализованный целевой путь (lower + /)
+     - raw_pat: строка паттерна (для отладки)
+    """
+    __slots__ = ("pattern", "literal_norm", "new_norm", "raw_pat")
+
+    def __init__(self, pattern: re.Pattern, literal_norm: str, new_norm: str, raw_pat: str):
+        self.pattern = pattern
+        self.literal_norm = literal_norm
+        self.new_norm = new_norm
+        self.raw_pat = raw_pat
+
+def slash_class_pattern_from_literal(literal_norm: str) -> str:
+    """
+    Превращает нормализованный литерал (с /) в regex, допускающий / или \ в тексте.
+    """
+    esc = re.escape(literal_norm)
+    # заменим экранированные слэши на класс
+    esc = esc.replace("/", r"[/\\]")
+    # ограничители по "словности", чтобы не резать идентификаторы
+    pat = rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])"
+    return pat
+
+def build_replacements(pairs: List[Tuple[str, str]]) -> List[Replacement]:
+    """
+    Генерирует список Replacement:
+     - из каждой пары OLD/NEW генерирует варианты OLD
+     - дедуплицирует по literal_norm
+     - сортирует по длине literal_norm (desc)
+    Конфликтующие маппинги логируются как [MISS], выбирается первый встретившийся.
+    """
+    mapping: Dict[str, str] = {}  # literal_norm -> new_norm
+    order: List[str] = []         # для сохранения порядка появления (до сортировки)
+    for old, new in pairs:
+        old_norm = normalize_name(old)
+        new_norm = normalize_name(new)
+        # При желании можно ограничить только /tpl:
+        # if "/tpl" not in old_norm: continue
+        variants = gen_variants(old)
+        for v in variants:
+            lit = normalize_text(v)  # lower + /
+            if lit in mapping:
+                if mapping[lit] != new_norm:
+                    STATS["conflicts"] += 1
+                    log_action("MISS", "-", reason=f"Конфликт правил для '{lit}': '{mapping[lit]}' vs '{new_norm}'")
+                continue
+            mapping[lit] = new_norm
+            order.append(lit)
+
+    # Сортировка по длине literal_norm (desc), чтобы длинные совпадения шли первыми.
+    order_sorted = sorted(order, key=lambda s: len(s), reverse=True)
+
+    replacements: List[Replacement] = []
+    for lit in order_sorted:
+        raw_pat = slash_class_pattern_from_literal(lit)
+        try:
+            creg = re.compile(raw_pat, re.IGNORECASE)
+        except re.error as e:
+            log_action("MISS", "-", reason=f"Невалидный regex паттерн для '{lit}': {e}")
+            continue
+        replacements.append(Replacement(creg, lit, mapping[lit], raw_pat))
+
+    return replacements
+
+# === ПОИСК И ЗАМЕНА ===
+
+JOIN_RE = re.compile(
+    r"os\.path\.join\s*\((.*?)\)",
+    re.DOTALL | re.IGNORECASE
+)
+
+def replace_in_join_calls(text: str, replacements: List[Replacement], file_path: str) -> str:
+    """
+    Замены внутри os.path.join(...), учитывая многострочные вызовы.
+    Стратегия:
+     1) Нормализуем аргументы (убираем whitespace, /, lower) для "вхождение?"
+     2) Если literal_norm обнаружен, выполняем re.sub по исходному с соответствующим паттерном.
+    """
+
+    def repl(match: re.Match) -> str:
+        args_str = match.group(1)
+        args_clean = normalize_text(re.sub(r"\s+", "", args_str))
+        updated = args_str
+        applied_any = False
+
+        for rep in replacements:
+            if rep.literal_norm in args_clean:
+                if is_excluded(args_str):
+                    log_action("SKIP", file_path, reason="Исключено по фильтру (join)", line=args_str.strip())
+                    continue
+                new_seg = rep.pattern.sub(rep.new_norm.replace("/", os.sep), updated)
+                if new_seg != updated:
+                    log_action("OK", file_path, old=updated.strip(), new=new_seg.strip(), line=args_str.strip())
+                    updated = new_seg
+                    applied_any = True
+
+        return f"os.path.join({updated})" if applied_any else match.group(0)
+
+    return JOIN_RE.sub(repl, text)
+
+def write_atomic(path: Path, content: str):
+    """
+    Атомарная запись: через временный файл и замену.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp__")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    # Для Windows: заменяем атрибуты времени и прав — просто replace
+    os.replace(tmp, path)
+
+def backup_file(src: Path, backup_root: Path):
+    """
+    Создаёт бэкап файла в BACKUP_DIR с сохранением относительного пути.
+    """
+    rel_path = rel(src)
+    dst = backup_root / rel_path
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+def process_file(file_path: Path, replacements: List[Replacement]) -> bool:
+    """
+    Обрабатывает один файл:
+     - построчные замены по паттернам
+     - замены внутри os.path.join(...)
+     - логирует каждое изменение/пропуск
+    Возвращает True, если были изменения.
+    """
+    try:
+        text = file_path.read_text(encoding="utf-8")
+    except Exception as e:
+        log_action("MISS", rel(file_path), reason=f"Не удалось прочитать файл: {e}")
+        return False
+
+    original_text = text
+    changed = False
+
+    # Построчные подстановки (f-строки, конкатенации, прямые литералы и т.п.)
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines, start=1):
+        orig_line = line
+        for rep in replacements:
+            if rep.pattern.search(line):
+                if is_excluded(line):
+                    log_action("SKIP", rel(file_path), i, reason="Исключено по фильтру", line=line.strip())
+                    continue
+                new_line = rep.pattern.sub(rep.new_norm.replace("/", os.sep), line)
+                if new_line != line:
+                    log_action("OK", rel(file_path), i, old=line.strip(), new=new_line.strip(), line=line.strip())
+                    line = new_line
+        if line != orig_line:
+            lines[i - 1] = line
+            changed = True
+
+    text = "".join(lines)
+
+    # os.path.join(...)
+    new_text = replace_in_join_calls(text, replacements, rel(file_path))
+    if new_text != text:
+        text = new_text
+        changed = True
+
+    if changed and not DRY_RUN:
+        try:
+            if BACKUP:
+                backup_root = PROJECT_ROOT / BACKUP_DIR / now_stamp()
+                backup_file(file_path, backup_root)
+            if ATOMIC_WRITE:
+                write_atomic(file_path, text)
+            else:
+                file_path.write_text(text, encoding="utf-8")
+        except Exception as e:
+            log_action("MISS", rel(file_path), reason=f"Ошибка записи: {e}")
+            return False
+
+    return changed
+
+# === ОБХОД ФАЙЛОВ ===
+
+def collect_target_files(root: Path) -> List[Path]:
+    """
+    Собирает список целевых файлов по расширениям, детерминированно (сортировка).
+    """
+    files: List[Path] = []
+    root = root.resolve()
+    for p in root.rglob("*"):
+        if p.is_file():
+            if p.suffix.lower() in TARGET_EXTENSIONS:
+                files.append(p)
+    files.sort(key=lambda p: str(p.resolve()).lower())
+    return files
+
+# === MAIN ===
+
+def main():
+    """
+    Главный процесс:
+     1) Инициализация лога
+     2) Загрузка пар OLD/NEW
+     3) Построение Replacement-правил (с дедупликацией, сортировкой по длине)
+     4) Дет. сбор файлов
+     5) Пофайловая обработка, бэкап/atomic write, dry-run
+     6) Итоговый отчёт
+    """
+    init_log()
+
+    # 1) Загрузка пар
+    pairs = load_pairs()
+    if not pairs:
+        log_action("MISS", "-", reason="Нет пар для обработки")
+        log_summary()
+        return
+
+    # 2) Построение Replacement правил
+    replacements = build_replacements(pairs)
+    if not replacements:
+        log_action("MISS", "-", reason="Не получилось собрать правила замены")
+        log_summary()
+        return
+
+    # 3) Вывод краткой сводки по правилам (первые 10 для видимости)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write("=== RULES (TOP 10) ===\n")
+        for i, rep in enumerate(replacements[:10], start=1):
+            f.write(f"{i:02d}. literal='{rep.literal_norm}' -> '{rep.new_norm}'\n")
+        f.write(f"... total rules: {len(replacements)}\n\n")
+
+    # 4) Сбор целевых файлов
+    files = collect_target_files(PROJECT_ROOT)
+    if not files:
+        log_action("MISS", "-", reason="Нет целевых файлов с указанными расширениями")
+        log_summary()
+        return
+
+    # 5) Обработка
+    for file_path in files:
+        STATS["files_scanned"] += 1
+        changed = process_file(file_path, replacements)
+        if changed:
+            STATS["files_changed"] += 1
+
+    # 6) ИТОГО
+    log_summary()
+
+    # Вывод в stdout краткого результата
+    print(f"[DONE] scanned={STATS['files_scanned']} changed={STATS['files_changed']} "
+          f"ok={STATS['ok']} skip={STATS['skip']} miss={STATS['miss']} conflicts={STATS['conflicts']}")
+    print(f"Log: {LOG_FILE}")
+
+# === ENTRY ===
+
+if __name__ == "__main__":
+    main()

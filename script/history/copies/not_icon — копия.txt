@@ -1,0 +1,111 @@
+import json
+import re
+import unicodedata
+from pathlib import Path
+from typing import List, Dict, Any, Set
+
+# === Пути ===
+# items.json хранится тут:
+ITEMS_JSON = Path(r"C:\bot\tools\cfg\items.json")
+
+# 4 папки с готовыми ассетами лежат под C:\bot\tpl\...
+TPL = Path(r"C:\bot\tpl")
+DIRS = {
+    "предметы": TPL / "описание_предметов",             # full-иконки предметов
+    "монстры": TPL / "монстры",
+    "иконки": TPL / "иконки_предметов",       # иконки предметов
+    "руны": TPL / "иконки_рун",
+    "руны_full": TPL / "описание_рун",
+}
+
+# Куда сохранять отчёты
+OUT_NOT_ITEMS_FULL = ITEMS_JSON.parent / "not_items_full.json"
+OUT_NOT_ITEMS = ITEMS_JSON.parent / "not_icon.json"
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+# === Канонизация имени ===
+def canon_name(s: str) -> str:
+    # NFKC убирает "невидимые" различия, ё -> е для стабильного сравнения
+    s = unicodedata.normalize("NFKC", s).strip().lower().replace("ё", "е")
+    # убрать расширение (если вдруг пришло с ним) и хвост _full
+    s = re.sub(r"\.(png|jpg|jpeg|webp)$", "", s, flags=re.I)
+    s = re.sub(r"_full$", "", s)
+    # пробелы/дефисы/длинные тире -> _
+    s = re.sub(r"[\s\-–—]+", "_", s)
+    # оставить только буквы/цифры/_
+    s = re.sub(r"[^a-z0-9а-я_]", "", s)
+    # схлопнуть и обрезать _
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+# === Чтение items.json (под разные структуры) ===
+def load_item_names(p: Path) -> List[str]:
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    CAND_KEYS = ("name", "title", "display", "displayName", "name_ru", "title_ru")
+    names: List[str] = []
+
+    if isinstance(data, list):
+        for it in data:
+            if isinstance(it, str):
+                names.append(it)
+            elif isinstance(it, dict):
+                val = next((it[k] for k in CAND_KEYS if k in it and isinstance(it[k], str) and it[k].strip()), None)
+                if val:
+                    names.append(val)
+    elif isinstance(data, dict):
+        complex_values = any(isinstance(v, dict) for v in data.values())
+        if complex_values:
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    val = next((v[k2] for k2 in CAND_KEYS if k2 in v and isinstance(v[k2], str) and v[k2].strip()), None)
+                    names.append(val if val else k)
+                else:
+                    names.append(k)
+        else:
+            names = list(data.keys())
+
+    return [n for n in names if isinstance(n, str) and n.strip()]
+
+# === Сканирование папок (только изображения) ===
+def scan_dir_canon(path: Path) -> Set[str]:
+    out: Set[str] = set()
+    if not path.exists():
+        return out
+    for f in path.rglob("*"):
+        if f.is_file() and f.suffix.lower() in IMG_EXTS:
+            out.add(canon_name(f.stem))
+    return out
+
+# === Основной поток ===
+item_names = load_item_names(ITEMS_JSON)
+items_canon_to_original: Dict[str, str] = {canon_name(n): n for n in item_names}
+items_canon = set(items_canon_to_original.keys())
+
+S_predmety = scan_dir_canon(DIRS["предметы"])
+S_monstry  = scan_dir_canon(DIRS["монстры"])
+S_iconki   = scan_dir_canon(DIRS["иконки"])
+S_runy     = scan_dir_canon(DIRS["руны"])
+S_others_union = S_monstry | S_iconki | S_runy
+
+# 1) Из items.json — чего НЕТ в папке "предметы"
+not_items_full = sorted(items_canon_to_original[c] for c in items_canon if c not in S_predmety)
+
+# 2) Из items.json — чего НЕТ ни в одной из трёх папок (монстры ∪ иконки ∪ руны)
+not_items = sorted(items_canon_to_original[c] for c in items_canon if c not in S_others_union)
+
+# === Сохранение ===
+with open(OUT_NOT_ITEMS_FULL, "w", encoding="utf-8") as f:
+    json.dump(not_items_full, f, ensure_ascii=False, indent=2)
+
+with open(OUT_NOT_ITEMS, "w", encoding="utf-8") as f:
+    json.dump(not_items, f, ensure_ascii=False, indent=2)
+
+# === Быстрый sanity-check по паре известных названий
+for probe in ("Алая тиара", "Латные перчатки"):
+    c = canon_name(probe)
+    print(f"{probe} -> {c} | предметы={c in S_predmety}, иконки={c in S_iconki}, руны={c in S_runy}, монстры={c in S_monstry}")
+
+print(f"Готово. Списки сохранены в:\n- {OUT_NOT_ITEMS_FULL}\n- {OUT_NOT_ITEMS}")

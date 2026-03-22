@@ -1,0 +1,87 @@
+import os
+
+# ===== НАСТРОЙКИ =====
+TARGET_FOLDER = r"C:\bot\tpl\описание_предметов"  # Папка, где удаляем текст
+TEXT_TO_REMOVE = "_name"  # Текст, который нужно удалить из имени
+ONLY_FORMAT = "all"  # "all" или расширение без точки (например, "png")
+DRY_RUN = False  # True — только показать, что будет, без изменений
+RECURSIVE = False  # True — проходить по подпапкам
+REPLACE_SPACES = True  # Заменять пробелы на "_"
+RENAME_FOLDERS = True  # Переименовывать также папки
+
+
+# ===== ФУНКЦИИ =====
+def should_process(ext: str, only_format: str) -> bool:
+    """Проверка по расширению"""
+    if only_format.lower() == "all":
+        return True
+    return ext.lower() == "." + only_format.lower()
+
+
+def remove_text(name: str, ext: str, text_to_remove: str, replace_spaces: bool) -> str:
+    """Удаляет указанный текст из имени файла/папки в любом месте"""
+    if replace_spaces:
+        name = name.replace(" ", "_")
+    if text_to_remove in name:
+        new_name = name.replace(text_to_remove, "")
+        # Убираем двойные подчёркивания, если они появились
+        while "__" in new_name:
+            new_name = new_name.replace("__", "_")
+        return new_name + ext
+    return None  # сигнал пропуска
+
+
+def process_folder(
+    folder: str,
+    text_to_remove: str,
+    only_format: str,
+    dry_run: bool,
+    recursive: bool,
+    replace_spaces: bool,
+    rename_folders: bool,
+):
+    """Обработка файлов и папок"""
+    renamed = 0
+    for root, dirs, files in os.walk(folder):
+        # Папки
+        if rename_folders:
+            for d in list(dirs):
+                old_path = os.path.join(root, d)
+                name, ext = os.path.splitext(d)
+                new_name = remove_text(name, ext, text_to_remove, replace_spaces)
+                if new_name is None:
+                    continue
+                new_path = os.path.join(root, new_name)
+                if dry_run:
+                    print(f"[DRY] DIR  {d} -> {new_name}")
+                else:
+                    os.rename(old_path, new_path)
+                    print(f"[OK]  DIR  {d} -> {new_name}")
+                    renamed += 1
+
+        # Файлы
+        for f in files:
+            old_path = os.path.join(root, f)
+            name, ext = os.path.splitext(f)
+            if not should_process(ext, only_format):
+                continue
+            new_name = remove_text(name, ext, text_to_remove, replace_spaces)
+            if new_name is None:
+                continue
+            new_path = os.path.join(root, new_name)
+            if dry_run:
+                print(f"[DRY] FILE {f} -> {new_name}")
+            else:
+                os.rename(old_path, new_path)
+                print(f"[OK]  FILE {f} -> {new_name}")
+                renamed += 1
+
+        if not recursive:
+            break
+
+    print(f"[DONE] Переименовано: {renamed}")
+
+
+# ===== ЗАПУСК =====
+if __name__ == "__main__":
+    process_folder(TARGET_FOLDER, TEXT_TO_REMOVE, ONLY_FORMAT, DRY_RUN, RECURSIVE, REPLACE_SPACES, RENAME_FOLDERS)

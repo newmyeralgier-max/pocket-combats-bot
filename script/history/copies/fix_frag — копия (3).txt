@@ -1,0 +1,128 @@
+import csv
+import shutil
+from pathlib import Path
+
+# === НАСТРОЙКИ ===
+PROJECT_ROOT = Path(r"C:\bot")
+OLD_LIST = PROJECT_ROOT / "old_file_list.txt"
+NEW_LIST = PROJECT_ROOT / "new_file_list.txt"
+PATH_MAP_FILE = PROJECT_ROOT / "path_map.csv"
+BACKUP_DIR = PROJECT_ROOT / "_backup_replacements"
+
+DRY_RUN = True  # False = реальная замена
+ENCODINGS = ["utf-8", "utf-8-sig", "cp1251"]
+
+# Фильтры
+STOP_FOLDERS = [
+    "/back/", "\\back\\",
+    "/tools/tpl/", "\\tools\\tpl\\"
+]
+TPL_MARKERS = ["/tpl/", "\\tpl\\"]
+
+# Ограничение области поиска (None = весь проект)
+LIMIT_DIR = None  # или PROJECT_ROOT / "tpl"
+
+# === УТИЛИТЫ ===
+def normalize_path(path_str: str) -> str:
+    return path_str.strip().replace("\\", "/")
+
+def read_list(file_path: Path) -> list:
+    lines = []
+    for raw_line in file_path.read_text(encoding="utf-8-sig").splitlines():
+        line = normalize_path(raw_line)
+        if not line:
+            continue
+        low = line.lower()
+        if not any(marker in low for marker in [m.lower() for m in TPL_MARKERS]):
+            continue
+        if any(stop in low for stop in STOP_FOLDERS):
+            continue
+        lines.append(line)
+    return lines
+
+def build_path_map(old_files: list, new_files: list) -> dict:
+    path_map = {}
+    for old in sorted(old_files, key=lambda x: x.lower()):
+        fname = Path(old).name.lower()
+        matches = [n for n in new_files if Path(n).name.lower() == fname]
+        if matches:
+            path_map[old] = matches[0]
+    return path_map
+
+def save_path_map(path_map: dict, csv_path: Path):
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        for old, new in sorted(path_map.items(), key=lambda x: x[0].lower()):
+            writer.writerow([old, new])
+    print(f"[OK] path_map.csv создан: {len(path_map)} строк")
+
+def load_path_map(csv_path: Path) -> list:
+    mapping = []
+    with open(csv_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        reader = csv.reader(f, delimiter=";")
+        for row in reader:
+            if len(row) != 2:
+                continue
+            old, new = row
+            old, new = old.strip(), new.strip()
+            if old and new and old != new:
+                mapping.append((old, new))
+    return mapping
+
+def backup_file(file_path: Path):
+    backup_path = BACKUP_DIR / file_path.relative_to(PROJECT_ROOT)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(file_path, backup_path)
+
+def replace_in_file(file_path: Path, mapping: list):
+    text = None
+    for enc in ENCODINGS:
+        try:
+            text = file_path.read_text(encoding=enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        print(f"[SKIP] Не удалось прочитать {file_path}")
+        return
+
+    orig_text = text
+    for old, new in mapping:
+        if old in text:
+            print(f"[{file_path}] {old} -> {new}")
+            if not DRY_RUN:
+                text = text.replace(old, new)
+
+    if text != orig_text and not DRY_RUN:
+        backup_file(file_path)
+        file_path.write_text(text, encoding="utf-8")
+
+# === ОСНОВНОЙ ЗАПУСК ===
+if __name__ == "__main__":
+    BACKUP_DIR.mkdir(exist_ok=True)
+
+    # 1. Читаем списки
+    old_files = read_list(OLD_LIST)
+    new_files = read_list(NEW_LIST)
+    print(f"[INFO] Старых файлов (tpl): {len(old_files)}")
+    print(f"[INFO] Новых файлов (tpl): {len(new_files)}")
+
+    # 2. Генерация карты
+    path_map_dict = build_path_map(old_files, new_files)
+    print(f"[INFO] Совпадений найдено: {len(path_map_dict)}")
+    save_path_map(path_map_dict, PATH_MAP_FILE)
+
+    # 3. Загрузка карты для замены
+    path_map = load_path_map(PATH_MAP_FILE)
+
+    # 4. Замена
+    search_root = LIMIT_DIR if LIMIT_DIR else PROJECT_ROOT
+    for file_path in search_root.rglob("*"):
+        if file_path.is_file():
+            replace_in_file(file_path, path_map)
+
+    # 5. Итог
+    if DRY_RUN:
+        print("\n[DRY_RUN] Изменения не сохранены. Проверь вывод выше.")
+    else:
+        print("\n[OK] Замены выполнены. Бэкапы в", BACKUP_DIR)

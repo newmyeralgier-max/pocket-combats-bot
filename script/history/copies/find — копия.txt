@@ -1,0 +1,122 @@
+import cv2, numpy as np, glob, os, json
+from datetime import datetime
+
+# === Конфиг ===
+with open(r"C:\bot\tools\cfg\config.json", "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+ITEMS_X1, SAFE_Y1, ITEMS_X2, SAFE_Y2 = cfg.get("ITEMS_ROI", [0, 0, 0, 0])
+ITEM_SCALES = [0.88, 0.92, 0.96, 1.00, 1.04, 1.08, 1.12]
+ITEM_NAME_THRESHOLD = 0.60   # временно понижен для видимости кандидатов
+SHIFT_BATTLE = False
+PREPROC_MODE = "gray"        # "gray" или "sobel"
+
+# === Пути ===
+screens_dir = r"C:\bot\back\screens"
+tpl_root = r"C:\bot\tpl"
+tpl_groups = ["имя_предметов", "имя_рун"]
+out_dir = r"C:\bot\debug\out_test"
+debug_dir = os.path.join(out_dir, "debug_pairs")
+os.makedirs(out_dir, exist_ok=True)
+os.makedirs(debug_dir, exist_ok=True)
+
+GROUP_COLORS = {
+    "имя_предметов": (0, 255, 0),
+    "имя_рун": (255, 0, 0)
+}
+
+METHOD = cv2.TM_CCOEFF_NORMED
+MIN_DY = 10  # минимальный вертикальный разнос между совпадениями
+
+def log(msg):
+    print(msg)
+    with open(os.path.join(out_dir, "match_log.txt"), "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+# === Загрузка только Янтаря ===
+def load_templates():
+    templates = []
+    for group in tpl_groups:
+        group_dir = os.path.join(tpl_root, group)
+        if not os.path.exists(group_dir):
+            continue
+        for ext in ("*.png", "*.PNG"):
+            for path in glob.glob(os.path.join(group_dir, ext)):
+                name = os.path.basename(path)
+                if "desc" in name.lower():
+                    continue
+                if "янтарь" not in name.lower():
+                    continue
+                img_gray = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                if img_gray is not None:
+                    templates.append((group, name, img_gray))
+    log(f"[INFO] Загружено шаблонов: {len(templates)}")
+    return templates
+
+# === Препроцесс (одинаковый для ROI и шаблона) ===
+def preprocess_gray(gray, mode):
+    if mode == "gray":
+        return gray
+    elif mode == "sobel":
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        g = clahe.apply(gray)
+        g = cv2.bilateralFilter(g, 5, 75, 75)
+        grad_x = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+        grad = cv2.convertScaleAbs(cv2.addWeighted(grad_x, 0.5, grad_y, 0.5, 0))
+        return grad
+    else:
+        return gray
+
+# === Поиск всех вхождений с подавлением дублей ===
+def find_all_matches(roi_proc, tpl_gray, thr):
+    picks = []
+    for scale in ITEM_SCALES:
+        tpl_scaled = cv2.resize(tpl_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        tpl_scaled = preprocess_gray(tpl_scaled, PREPROC_MODE)
+        h, w = tpl_scaled.shape
+        if h > roi_proc.shape[0] or w > roi_proc.shape[1]:
+            continue
+        res = cv2.matchTemplate(roi_proc, tpl_scaled, METHOD)
+        ys, xs = np.where(res >= thr)
+        for (y, x) in zip(ys, xs):
+            # проверка на вертикальный разнос
+            if all(abs(y - py) >= MIN_DY for _, (px, py, pw, ph) in picks):
+                picks.append((float(res[y, x]), (x, y, w, h)))
+    # сортировка: сверху вниз, при равенстве — по score
+    picks.sort(key=lambda m: (m[1][1], -m[0]))
+    return picks
+
+templates = load_templates()
+shift_y = 150 if SHIFT_BATTLE else 0
+
+for screen_path in glob.glob(os.path.join(screens_dir, "*.png")):
+    img = cv2.imdecode(np.fromfile(screen_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        log(f"[WARN] Не удалось загрузить {screen_path}")
+        continue
+
+    # ROI
+    roi_raw_bgr = img[SAFE_Y1+shift_y:SAFE_Y2+shift_y, ITEMS_X1:ITEMS_X2].copy()
+    roi_raw_bgr = roi_raw_bgr[20:, :]  # убираем "Игроки"
+    roi_gray = cv2.cvtColor(roi_raw_bgr, cv2.COLOR_BGR2GRAY)
+    roi_proc = preprocess_gray(roi_gray, PREPROC_MODE)
+
+    found = 0
+    for group, tpl_name, tpl_gray in templates:
+        matches = find_all_matches(roi_proc, tpl_gray, ITEM_NAME_THRESHOLD)
+        for score, (x, y, w, h) in matches:
+            # рисуем на полном скрине
+            abs_pt = (ITEMS_X1 + x, SAFE_Y1 + shift_y + 20 + y)
+            color = GROUP_COLORS.get(group, (0, 255, 0))
+            cv2.rectangle(img, abs_pt, (abs_pt[0] + w, abs_pt[1] + h), color, 1)
+            cv2.putText(img, tpl_name, (abs_pt[0], max(0, abs_pt[1]-2)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            found += 1
+        log(f"[OK] {tpl_name} — найдено: {len(matches)}")
+
+    out_path = os.path.join(out_dir, os.path.basename(screen_path))
+    cv2.imencode(".png", img)[1].tofile(out_path)
+    log(f"[OK] {os.path.basename(screen_path)} — всего найдено: {found}")
+
+log("[DONE] Обработка завершена")

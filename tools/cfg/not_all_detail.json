@@ -1,0 +1,682 @@
+[
+  {
+    "name": "Алое_одеяние",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Алые_ботинки",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Алые_Перчатки",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Бебут",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Благословение",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Боевая_Руна",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Боевые_вилы",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ботинки_звездочёта",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ботинки_Магмы",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Бумажное_Солнце",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Верный_Меч",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ветвь_мёртвого_дерева",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ветеранская_Ярость",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Вулканическая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Гордость_Подлеца",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Дары_злых_деяний",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Демонический_меч",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Дух_Хищника",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Жуткий_посох",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Жёлтые_ягоды",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Зачарованная_стамеска",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Звездный_лук",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Звериная_Хватка",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Звериное_начало",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Звериное_чутьё",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Зелёное_зелье",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Зелёные_ягоды",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Землетрясение_в_бутылке",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Имперское_копьё",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Каменная_Преграда",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Карающая_Книга",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Клеймор",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Колпак_Подлости",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Копьё",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Кристалл_Сожалений",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ледяной_фальшион",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Лесной_посох",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Лук",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Лёгкая_накидка",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Лёгкие_перчатки",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Лёгкие_сапоги",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Мантия_Звездочёта",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Молот_Оправдания",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Насмешка_Голема",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Незамерзающая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Непроницаемая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Обман_Иккли",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Огненный_Страж",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Ожерелье_из_ушей",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Освобождающая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Панцирь_Шогнгота",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Перчатки_злых_деяний",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Перчатки_повелителя_холода",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Перчатки_Подлости",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Перчатки_Тёмного_Знания",
+    "missing": {
+      "full": true,
+      "icon": true,
+      "title": true
+    }
+  },
+  {
+    "name": "Плавники",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Плетёная_верёвка",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Порошок_стёртых_пяток",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Посох_из_Мёртвого_дерева",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Прозрение_Воина",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Проклинающая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Пылающее_сердце",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Роба_терзателя",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Руна_Правосудия",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Руна_Противостояния",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Руна_Силы",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Руническая_Печать",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Сапоги_злых_намерений",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Сапоги_повелителя_холода",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Сокрушающая_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Стилет",
+    "missing": {
+      "full": false,
+      "icon": true,
+      "title": false
+    }
+  },
+  {
+    "name": "Стрелы",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Стёганые_перчатки",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Терзающий_лук",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Тлеющий_уголёк",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Турнирное_копьё",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Тёмное_Знание",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Тёмный_лук",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Тёмный_меч",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Тёмный_щит",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Хищная_Руна",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": false
+    }
+  },
+  {
+    "name": "Хищная_Хватка",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Шлем-плавник",
+    "missing": {
+      "full": false,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Шлем_Магмы",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  },
+  {
+    "name": "Эхо_Войны",
+    "missing": {
+      "full": true,
+      "icon": false,
+      "title": true
+    }
+  }
+]

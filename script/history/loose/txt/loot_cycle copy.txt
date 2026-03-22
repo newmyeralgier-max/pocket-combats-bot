@@ -1,0 +1,478 @@
+# -*- coding: utf-8 -*-
+# auto_loot_worker.py
+# Полный автономный лут-воркер: сам открывает вкладку "Вещи", кликает ячейки,
+# ловит попап и жмет "Подобрать". Уважает "стрелки" (open/close) рядом с табами.
+# Логи в стиле [state]/[action]/[detect]/[error], diag-снимки, ROI из JSON.
+
+import os
+import sys
+import cv2
+import json
+import time
+import math
+import glob
+import shlex
+import errno
+import argparse
+import subprocess
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+# -------------------------
+# CONFIG
+# -------------------------
+CONFIG = {
+    "adb_serial": None,  # задается из аргументов
+    "work_dir": ".",
+    "diag_dir": "diag",
+    "log_dir": "logs",
+    "log_file": "logs/loot_run.txt",
+    "tpl_dir": "tpl",
+
+    # шаблоны
+    "tpl": {
+        "items_tab": "tpl/templates/items_tab.png",
+        "monsters_tab": "tpl/my/monster_tab.png",
+        "arrow_open": "tpl/templates/open_tab.png",
+        "arrow_close": "tpl/templates/close_tab.png",
+        "items_hdr": "tpl/my/items_hdr.png",
+        "monsters_hdr": "tpl/my/monster_hdr.png",
+        "pickup_own": "tpl/my/pickup_own.png",
+        "pickup_other": "tpl/my/pickup_other.png",
+    },
+
+    # пороги
+    "th": {
+        "tab": 0.85,
+        "arrow": 0.85,
+        "header": 0.84,
+        "pickup": 0.88,
+    },
+
+    # ROI-файл (нормализованные координаты [x,y,w,h] от 0..1)
+    "roi_file": "roi_calibrated.json",
+
+    # дефолтные ROI (если нет файла)
+    # все значения относительные, умножаются на размеры текущего экрана
+    "roi_defaults": {
+        "left_panel_tabs": [0.00, 0.15, 0.18, 0.70],  # левая колонка с табами
+        "items_tab":       [0.00, 0.18, 0.18, 0.10],
+        "monsters_tab":    [0.00, 0.30, 0.18, 0.10],
+        "items_hdr":       [0.18, 0.12, 0.35, 0.10],  # область заголовка "Вещи"
+        "monsters_hdr":    [0.18, 0.12, 0.35, 0.10],  # область заголовка "Монстры"
+        "loot_list":       [0.18, 0.22, 0.40, 0.58],  # список лута (ячейки)
+        "pickup_area":     [0.55, 0.78, 0.35, 0.20],  # зона кнопки "Подобрать"
+    },
+
+    # геометрия списка: сколько ячеек кликаем сверху вниз
+    "loot_slots": 8,
+
+    # ожидания
+    "sleep_after_tap": 0.25,
+    "sleep_after_popup": 0.35,
+    "max_cycles": 120,  # ограничение по итерациям run-цикла
+}
+
+# -------------------------
+# FS utils & logging
+# -------------------------
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def diag_name():
+    return "diag_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".png"
+
+LOG_FH = None
+def log_open(path):
+    global LOG_FH
+    ensure_dir(os.path.dirname(path))
+    LOG_FH = open(path, "a", encoding="utf-8", buffering=1)
+
+def log_line(tag, msg):
+    line = f"[{now_str()}] [{tag}] {msg}"
+    print(line)
+    if LOG_FH:
+        LOG_FH.write(line + "\n")
+
+def log_state(msg):  log_line("run] [state", msg)
+def log_action(msg): log_line("run] [action", msg)
+def log_detect(msg): log_line("detect]", msg)
+def log_error(msg):  log_line("error]", msg)
+
+# -------------------------
+# ADB helpers
+# -------------------------
+def adb_cmd(serial, cmd):
+    full = f"adb -s {serial} {cmd}"
+    return full
+
+def adb_exec(serial, cmd, capture_output=False):
+    full = adb_cmd(serial, cmd)
+    try:
+        if capture_output:
+            return subprocess.check_output(shlex.split(full), stderr=subprocess.STDOUT)
+        else:
+            subprocess.check_call(shlex.split(full))
+            return b""
+    except subprocess.CalledProcessError as e:
+        log_error(f"[adb] cmd failed: {full} | {e}")
+        return None
+
+def adb_screencap(serial, diag_dir):
+    ensure_dir(diag_dir)
+    raw = adb_exec(serial, "exec-out screencap -p", capture_output=True)
+    if raw is None:
+        return None, None
+    fn = os.path.join(diag_dir, diag_name())
+    with open(fn, "wb") as f:
+        f.write(raw)
+    log_detect(f"[adb] pulled {os.path.basename(fn)} ({len(raw):,} bytes)")
+    arr = np.frombuffer(raw, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img, fn
+
+def adb_tap(serial, x, y):
+    adb_exec(serial, f"shell input tap {int(x)} {int(y)}")
+
+# -------------------------
+# Image helpers
+# -------------------------
+def read_img(path):
+    if not os.path.exists(path):
+        log_error(f"[tpl] not found: {path}")
+        return None
+    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return img
+
+def crop(img, roi_px):
+    x, y, w, h = roi_px
+    return img[y:y+h, x:x+w].copy()
+
+def to_px(roi_rel, W, H):
+    x = max(0, min(W-1, int(round(roi_rel[0] * W))))
+    y = max(0, min(H-1, int(round(roi_rel[1] * H))))
+    w = max(1, int(round(roi_rel[2] * W)))
+    h = max(1, int(round(roi_rel[3] * H)))
+    if x+w > W: w = W - x
+    if y+h > H: h = H - y
+    return [x, y, w, h]
+
+def match_best(img, tpl, roi_px=None, th=0.85):
+    hay = crop(img, roi_px) if roi_px else img
+    res = cv2.matchTemplate(hay, tpl, cv2.TM_CCOEFF_NORMED)
+    minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(res)
+    if maxVal >= th:
+        x = maxLoc[0] + (roi_px[0] if roi_px else 0)
+        y = maxLoc[1] + (roi_px[1] if roi_px else 0)
+        return True, (x, y), maxVal
+    return False, (0, 0), maxVal
+
+def center_of_match(match_xy, tpl_shape):
+    th, tw = tpl_shape[:2]
+    return (match_xy[0] + tw // 2, match_xy[1] + th // 2)
+
+# -------------------------
+# ROI loading
+# -------------------------
+def load_roi_map():
+    roi = dict(CONFIG["roi_defaults"])
+    f = CONFIG["roi_file"]
+    if os.path.exists(f):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                custom = json.load(fh)
+            for k, v in custom.items():
+                if isinstance(v, list) and len(v) == 4:
+                    roi[k] = v
+            log_detect(f"[roi] loaded {f}")
+        except Exception as e:
+            log_error(f"[roi] failed to load {f}: {e}")
+    else:
+        log_detect("[roi] using defaults")
+    return roi
+
+# -------------------------
+# State detection using headers + tabs + arrows
+# -------------------------
+class State:
+    def __init__(self):
+        self.items_open = None    # True/False/None
+        self.monsters_open = None # True/False/None
+
+def detect_tab_open(img, tpl_tab, tpl_arrow_open, tpl_arrow_close, roi_tab_px, th_tab, th_arrow):
+    # 1) находим сам таб
+    ok_tab, tab_xy, v_tab = match_best(img, tpl_tab, roi_tab_px, th_tab)
+    if not ok_tab:
+        return None, {"why": "tab_not_found", "score": v_tab}
+
+    # 2) ищем стрелки рядом с табом (в локальной области вокруг таба)
+    # расширим локальную зону вокруг ROI таба
+    pad = 10
+    x, y, w, h = roi_tab_px
+    roi_local = [max(0, x - pad), max(0, y - pad), min(w + 2*pad, img.shape[1]-x+pad), min(h + 2*pad, img.shape[0]-y+pad)]
+
+    ok_open, open_xy, v_open = match_best(img, tpl_arrow_open, roi_local, th_arrow)
+    ok_close, close_xy, v_close = match_best(img, tpl_arrow_close, roi_local, th_arrow)
+
+    if ok_open and not ok_close:
+        return True, {"why": "arrow_open", "tab_score": v_tab, "open_score": v_open}
+    if ok_close and not ok_open:
+        return False, {"why": "arrow_close", "tab_score": v_tab, "close_score": v_close}
+
+    # не различили стрелку — неизвестно
+    return None, {"why": "arrow_ambiguous", "tab_score": v_tab, "open_score": v_open, "close_score": v_close}
+
+def detect_header_present(img, tpl_hdr, roi_hdr_px, th_hdr):
+    ok, xy, v = match_best(img, tpl_hdr, roi_hdr_px, th_hdr)
+    return ok, v
+
+def detect_state(img, W, H, roimap, tpls, th):
+    st = State()
+
+    # вычислить все ROI в пикселях
+    roi_items_tab_px    = to_px(roimap["items_tab"], W, H)
+    roi_monsters_tab_px = to_px(roimap["monsters_tab"], W, H)
+    roi_items_hdr_px    = to_px(roimap["items_hdr"], W, H)
+    roi_monsters_hdr_px = to_px(roimap["monsters_hdr"], W, H)
+
+    # 1) сначала пытаемся по стрелкам у табов
+    it_open, it_info = detect_tab_open(img, tpls["items_tab"], tpls["arrow_open"], tpls["arrow_close"], roi_items_tab_px, th["tab"], th["arrow"])
+    mn_open, mn_info = detect_tab_open(img, tpls["monsters_tab"], tpls["arrow_open"], tpls["arrow_close"], roi_monsters_tab_px, th["tab"], th["arrow"])
+
+    # 2) затем подтверждаем по заголовкам (независимо, если есть)
+    items_hdr_ok, items_hdr_v = detect_header_present(img, tpls["items_hdr"], roi_items_hdr_px, th["header"])
+    monsters_hdr_ok, monsters_hdr_v = detect_header_present(img, tpls["monsters_hdr"], roi_monsters_hdr_px, th["header"])
+
+    # агрегируем
+    st.items_open    = it_open
+    st.monsters_open = mn_open
+
+    # если стрелки не дали уверенности — используем заголовки
+    if st.items_open is None and items_hdr_ok:
+        st.items_open = True
+    if st.monsters_open is None and monsters_hdr_ok:
+        st.monsters_open = True
+
+    # лог диагностики
+    log_state(f"[fallback] items_open={st.items_open} monsters_open={st.monsters_open}")
+
+    return st
+
+# -------------------------
+# Pickup detection
+# -------------------------
+def detect_pickup(img, W, H, roimap, tpls, th):
+    roi_pickup_px = to_px(roimap["pickup_area"], W, H)
+
+    # own
+    ok1, xy1, v1 = match_best(img, tpls["pickup_own"], roi_pickup_px, th["pickup"])
+    if ok1:
+        c = center_of_match(xy1, tpls["pickup_own"].shape)
+        return ("own", c, v1)
+
+    # other
+    ok2, xy2, v2 = match_best(img, tpls["pickup_other"], roi_pickup_px, th["pickup"])
+    if ok2:
+        c = center_of_match(xy2, tpls["pickup_other"].shape)
+        return ("other", c, v2)
+
+    return (None, None, 0.0)
+
+# -------------------------
+# Items list clicking
+# -------------------------
+def iter_loot_cells(W, H, roimap, slots):
+    rx, ry, rw, rh = roimap["loot_list"]
+    x, y, w, h = to_px([rx, ry, rw, rh], W, H)
+    # равномерно делим по вертикали
+    step = h / max(1, slots)
+    for i in range(slots):
+        cy = int(y + (i + 0.5) * step)
+        cx = int(x + w * 0.5)
+        yield i, (cx, cy)
+
+# -------------------------
+# Main loot logic
+# -------------------------
+def ensure_items_open(serial, img, W, H, roimap, tpls, th):
+    st = detect_state(img, W, H, roimap, tpls, th)
+
+    # если монстры открыты — переключаемся на Вещи
+    if st.monsters_open is True and st.items_open is not True:
+        # кликаем по items_tab
+        roi_items_tab_px = to_px(roimap["items_tab"], W, H)
+        ok, xy, v = match_best(img, tpls["items_tab"], roi_items_tab_px, th["tab"])
+        if ok:
+            c = center_of_match(xy, tpls["items_tab"].shape)
+            log_action("нажимаю 'items_tab' (переключиться с Монстры)")
+            adb_tap(serial, c[0], c[1])
+            time.sleep(CONFIG["sleep_after_tap"])
+        else:
+            # fallback: жмем центр ROI таба
+            cx = roi_items_tab_px[0] + roi_items_tab_px[2] // 2
+            cy = roi_items_tab_px[1] + roi_items_tab_px[3] // 2
+            log_action("нажимаю центр ROI 'items_tab' (fallback)")
+            adb_tap(serial, cx, cy)
+            time.sleep(CONFIG["sleep_after_tap"])
+
+        img2, _ = adb_screencap(serial, CONFIG["diag_dir"])
+        if img2 is None:
+            return False, st
+        st2 = detect_state(img2, W, H, roimap, tpls, th)
+        return (st2.items_open is True), st2
+
+    # если по стрелке items_open == False — раскрываем
+    if st.items_open is False:
+        roi_items_tab_px = to_px(roimap["items_tab"], W, H)
+        ok_tab, xy_tab, v_tab = match_best(img, tpls["items_tab"], roi_items_tab_px, th["tab"])
+        if ok_tab:
+            c = center_of_match(xy_tab, tpls["items_tab"].shape)
+            log_action("нажимаю 'items_tab' (раскрыть Вещи)")
+            adb_tap(serial, c[0], c[1])
+            time.sleep(CONFIG["sleep_after_tap"])
+            img2, _ = adb_screencap(serial, CONFIG["diag_dir"])
+            if img2 is None:
+                return False, st
+            st2 = detect_state(img2, W, H, roimap, tpls, th)
+            return (st2.items_open is True), st2
+        else:
+            # fallback: зона таба
+            cx = roi_items_tab_px[0] + roi_items_tab_px[2] // 2
+            cy = roi_items_tab_px[1] + roi_items_tab_px[3] // 2
+            log_action("нажимаю центр ROI 'items_tab' (fallback раскрытие)")
+            adb_tap(serial, cx, cy)
+            time.sleep(CONFIG["sleep_after_tap"])
+            img2, _ = adb_screencap(serial, CONFIG["diag_dir"])
+            if img2 is None:
+                return False, st
+            st2 = detect_state(img2, W, H, roimap, tpls, th)
+            return (st2.items_open is True), st2
+
+    # если и так True — отлично
+    return (st.items_open is True), st
+
+def try_pickup_if_visible(serial, img, W, H, roimap, tpls, th):
+    kind, c, v = detect_pickup(img, W, H, roimap, tpls, th)
+    if kind is None:
+        log_detect("кнопка 'Подобрать' не найдена")
+        return False
+    label = "pickup_own.png" if kind == "own" else "pickup_other.png"
+    log_action(f"нажимаю '{label}' @ ({c[0]},{c[1]})")
+    adb_tap(serial, c[0], c[1])
+    time.sleep(CONFIG["sleep_after_popup"])
+    log_action("подбор выполнен")
+    return True
+
+def click_loot_cells_and_pick(serial, img, W, H, roimap, tpls, th):
+    # кликаем по очереди ячейки списка, после каждого клика проверяем кнопку
+    changed = False
+    for idx, (cx, cy) in iter_loot_cells(W, H, roimap, CONFIG["loot_slots"]):
+        log_action(f"нажимаю ячейку лута {idx} @ ({cx},{cy})")
+        adb_tap(serial, cx, cy)
+        time.sleep(CONFIG["sleep_after_tap"])
+        img2, _ = adb_screencap(serial, CONFIG["diag_dir"])
+        if img2 is None:
+            continue
+        ok = try_pickup_if_visible(serial, img2, W, H, roimap, tpls, th)
+        if ok:
+            changed = True
+            # после подбора обновляем экран для следующего шага
+            img3, _ = adb_screencap(serial, CONFIG["diag_dir"])
+            if img3 is None:
+                break
+    return changed
+
+# -------------------------
+# Runner
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--serial", type=str, required=True, help="ADB serial, напр. 192.168.0.100:5555")
+    args = parser.parse_args()
+    CONFIG["adb_serial"] = args.serial
+
+    ensure_dir(CONFIG["diag_dir"])
+    ensure_dir(CONFIG["log_dir"])
+    log_open(CONFIG["log_file"])
+
+    # загрузка шаблонов
+    tpls = {}
+    for k, p in CONFIG["tpl"].items():
+        img = read_img(p)
+        if img is None:
+            log_error(f"[tpl] пропущен шаблон {k}: {p}")
+        tpls[k] = img
+
+    # проверка критичных шаблонов
+    critical = ["items_tab", "monsters_tab", "arrow_open", "arrow_close", "items_hdr", "pickup_own", "pickup_other"]
+    for ck in critical:
+        if tpls[ck] is None:
+            log_error(f"[tpl] критичный шаблон отсутствует: {ck} -> {CONFIG['tpl'][ck]}")
+    # продолжаем, но поведём себя максимально безопасно
+
+    roimap = load_roi_map()
+
+    log_state(f"RUN START [run] устройство: {CONFIG['adb_serial']}")
+    # опционально модель
+    out = adb_exec(CONFIG["adb_serial"], "shell getprop ro.product.model", capture_output=True)
+    if out is not None:
+        model = out.decode(errors="ignore").strip()
+        log_state(f"device model: {model}")
+
+    cycles = 0
+    last_progress_time = time.time()
+
+    while cycles < CONFIG["max_cycles"]:
+        cycles += 1
+
+        # скриншот
+        img, diag = adb_screencap(CONFIG["adb_serial"], CONFIG["diag_dir"])
+        if img is None:
+            time.sleep(0.3)
+            continue
+        H, W = img.shape[:2]
+
+        # состояние
+        st = detect_state(img, W, H, roimap, tpls, CONFIG["th"])
+        state_str = f"начальное состояние: Вещи: " + (("открыты" if st.items_open else ("закрыты" if st.items_open is False else "неизвестно"))) + \
+                    " | Монстры: " + (("открыты" if st.monsters_open else ("закрыты" if st.monsters_open is False else "неизвестно")))
+        log_state(state_str)
+
+        # гарантируем "Вещи" открыты
+        ok_items, st2 = ensure_items_open(CONFIG["adb_serial"], img, W, H, roimap, tpls, CONFIG["th"])
+        if not ok_items:
+            log_action("не удалось гарантировать 'Вещи открыты' — пробую снова в следующем цикле")
+            time.sleep(0.25)
+            continue
+        else:
+            log_action("Вещи уже открыты — ок")
+
+        # если видна кнопка "Подобрать" — жмем
+        picked = try_pickup_if_visible(CONFIG["adb_serial"], img, W, H, roimap, tpls, CONFIG["th"])
+        if picked:
+            last_progress_time = time.time()
+            continue
+
+        # иначе — открываем попапы ячейками и пытаемся подобрать
+        changed = click_loot_cells_and_pick(CONFIG["adb_serial"], img, W, H, roimap, tpls, CONFIG["th"])
+        if changed:
+            last_progress_time = time.time()
+            continue
+
+        # если ничего не изменилось — подождем небольшую смену кадра
+        log_action("подбор не доступен — жду изменений")
+        time.sleep(0.35)
+
+        # fail-safe по таймауту отсутствия прогресса (опционально)
+        if time.time() - last_progress_time > 60:
+            log_action("нет прогресса >60с — выхожу")
+            break
+
+    log_state("RUN STOP [run]")
+
+if __name__ == "__main__":
+    main()

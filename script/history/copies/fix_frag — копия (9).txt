@@ -1,0 +1,71 @@
+"""
+fix_paths.py — массовая замена путей по карте замен.
+- Читает path_map.csv (old;new)
+- Обходит файлы в ROOT_DIR с указанными расширениями
+- Подсчитывает замены и пишет подробный лог
+- DRY_RUN=True — только выводит, что изменится
+"""
+import csv
+import os
+MAP_FILE = 'import_map.csv'
+ROOT_DIR = 'C:/bot'
+EXTS = '.py', '.txt', '.json', '.cfg'
+DRY_RUN = False
+
+
+def load_path_map(csv_path):
+    mapping = []
+    with open(csv_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+        reader = csv.reader(f, delimiter=';')
+        for row in reader:
+            if len(row) != 2:
+                continue
+            old, new = row
+            old, new = old.strip(), new.strip()
+            if old and new and old != new:
+                mapping.append((old, new))
+    return mapping
+
+
+def replace_in_file(file_path, mapping):
+    count_in_file = 0
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+    orig_text = text
+    for old, new in mapping:
+        hits = text.count(old)
+        if hits > 0:
+            count_in_file += hits
+            if not DRY_RUN:
+                text = text.replace(old, new)
+            print(f'[{file_path}] {hits} × {old} -> {new}')
+    if count_in_file > 0 and not DRY_RUN and text != orig_text:
+        with open(file_path, 'w', encoding='utf-8', errors='ignore') as f:
+            f.write(text)
+    return count_in_file
+
+
+def main():
+    mapping = load_path_map(MAP_FILE)
+    if not mapping:
+        print('[WARN] path_map.csv пуст или невалиден')
+        return
+    total_replacements = 0
+    files_changed = 0
+    for root, _, files in os.walk(ROOT_DIR):
+        for name in files:
+            if name.lower().endswith(EXTS):
+                fp = os.path.join(root, name)
+                replaced_here = replace_in_file(fp, mapping)
+                if replaced_here:
+                    files_changed += 1
+                    total_replacements += replaced_here
+    print('=' * 50)
+    print(f'Файлов с изменениями: {files_changed}')
+    print(f'Всего замен: {total_replacements}')
+    if DRY_RUN:
+        print('[DRY_RUN] Изменения НЕ сохранены — смотри лог выше')
+
+
+if __name__ == '__main__':
+    main()
