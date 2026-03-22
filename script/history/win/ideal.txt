@@ -1,2 +1,0 @@
-"PICKUP_REL": [0.50, 0.17, 0.98, 0.85],
-    "PICKUP_REL_CARD_FALLBACK": [0.50, 0.17, 0.98, 0.85] 
