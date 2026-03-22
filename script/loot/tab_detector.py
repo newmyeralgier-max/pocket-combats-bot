@@ -168,8 +168,17 @@ def detect_tab_states(bgr: np.ndarray):
         elif down_in and not up_in:
             state = "закрыта"
         elif up_in and down_in:
-            state = "открыта" if open_score >= close_score else "закрыта"
+            # Если оба найдены с похожими счетами в одном месте — это скорее всего ошибка шаблона.
+            # Требуем разницу хотя бы в 0.02 или используем лучший.
+            diff = abs(open_score - close_score)
+            if diff < 0.02 and label == "монстры":
+                # Фолбэк для монстров: если разница ничтожна, считаем закрытым (безопаснее) 
+                # или пробуем найти более строгий признак.
+                state = "закрыта" if close_score > open_score else "открыта"
+            else:
+                state = "открыта" if open_score >= close_score else "закрыта"
         elif (open_found or close_found) and not (up_in or down_in):
+
             state = "стрелка уехала"
         else:
             state = "не определено"

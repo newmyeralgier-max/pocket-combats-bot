@@ -156,8 +156,10 @@ def fsm_loop():
                 cv2.imwrite(os.path.join(screen_dir, f"stuck_{now_ts()}.png"), fr)
                 
             clear_overlays(CFG, cooldown_s=0.0, log_no_overlay=False)
-            adb_cmd(["shell", "input", "keyevent", "4"])  # Back
+            from script.device.adb import keyevent
+            keyevent(4)  # Back
             log("[FSM] STATE_UNKNOWN recovery attempt (Back button + clear overlays)")
+
             time.sleep(3.0)
             
             fr_new = screenshot_bgr()

@@ -244,3 +244,12 @@ def device_swipe(dx: int, dy: int, duration_ms: int):
         if post is not None:
             snap("swipe_after", post, points=[(int(x_anchor), int(y_from)), (int(x_to), int(y_to))])
 
+def keyevent(code: int):
+    """Sends a key event via FastADB (e.g., 4 for Back)."""
+    try:
+        get_fast_adb().run_cmd(f"input keyevent {code}")
+        log(f"KEYEVENT {code}")
+    except Exception as e:
+        log(f"[ERROR] keyevent adb failed: {e}")
+
+
