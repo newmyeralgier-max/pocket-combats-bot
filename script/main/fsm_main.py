@@ -16,6 +16,7 @@ import cv2  # type: ignore[import-not-found]
 from script.loot.matcher import find_all_matches, preprocess_gray, TPL_CACHE  # type: ignore[import-not-found]
 from script.overlays.clear_overlays import clear_overlays, overlay_just_appeared  # type: ignore[import-not-found]
 from script.fight.fight import fight_loop_until_victory  # type: ignore[import-not-found]
+from script.core import coords as _coords  # type: ignore[import-not-found]
 
 # ── Runtime from auto_bot & other modules ────────────────────────────
 auto_bot = importlib.import_module("script.loot.auto_bot")
@@ -83,8 +84,9 @@ def _click_continue(CFG):
         fr = screenshot_bgr()
         if tpl is None or fr is None:
             # Фолбэк: безопасный тап ниже центра
-            tap_raw(int(CFG.get("SCREEN_W", 1080)) // 2, 2250, reason="fsm_continue_fallback")
-            structured_log("fsm_continue_fallback_tap")
+            fx, fy = _coords.rel_point(CFG, 0.5, 0.9146)  # 0.9146 ≈ 2250/2460
+            tap_raw(fx, fy, reason="fsm_continue_fallback")
+            structured_log("fsm_continue_fallback_tap", x=fx, y=fy)
             return
 
         mode = CFG.get("FIND", {}).get("PREPROC_MODE", "gray") or "gray"
@@ -105,8 +107,9 @@ def _click_continue(CFG):
             tap_raw(int(cx), int(cy), reason="fsm_continue_click")
             structured_log("fsm_continue_clicked", score=float(sc), scale=float(s), center=[int(cx), int(cy)])
         else:
-            tap_raw(int(CFG.get("SCREEN_W", 1080)) // 2, 2250, reason="fsm_continue_fallback_nohit")
-            structured_log("fsm_continue_fallback_nohit")
+            fx, fy = _coords.rel_point(CFG, 0.5, 0.9146)
+            tap_raw(fx, fy, reason="fsm_continue_fallback_nohit")
+            structured_log("fsm_continue_fallback_nohit", x=fx, y=fy)
     except Exception as e:
         structured_log("fsm_continue_click_error", error=str(e))
 
@@ -119,7 +122,20 @@ def fsm_loop():
     loops = 0
     total_fights = 0
     victories = 0
-    
+
+    # Опциональный авто-детект разрешения экрана по первому скриншоту.
+    # Нужно, если бот запущен на эмуляторе/устройстве с отличным от
+    # эталонного 1080×2460 разрешением. По умолчанию выключен.
+    if CFG.get("SCREEN_AUTO_DETECT"):
+        try:
+            fr0 = screenshot_bgr()
+            new_size = _coords.apply_detected_size(CFG, fr0)
+            if new_size is not None:
+                structured_log("fsm_screen_autodetect", w=new_size[0], h=new_size[1])
+                log(f"[FSM] screen size auto-detected: {new_size[0]}x{new_size[1]}")
+        except Exception as e:
+            structured_log("fsm_screen_autodetect_error", error=str(e))
+
     state_start_time = time.time()
     last_state = current_state
     unknown_retries = 0
