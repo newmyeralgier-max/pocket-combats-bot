@@ -48,6 +48,23 @@ DEFAULT_CFG: Dict[str, Any] = {
         "SCHARR_FALLBACK_OFFSET": 0.03,
         "FIND_ITEM_NAME": 0.86,
         "SYSCHAT": 0.85
+    },
+    # Опциональный HP/death-recovery в STATE_RECOVER
+    # (см. script/detection/player_status.py, script/overlays/heal.py).
+    # По умолчанию выключен — STATE_RECOVER работает как раньше
+    # (только clear_overlays → STATE_FIND).
+    "RECOVER": {
+        "ENABLED": False,
+        "DEAD_TPL": None,              # путь к шаблону экрана смерти/воскрешения
+        "DEAD_THRESHOLD": 0.85,
+        "DEAD_WAIT_S": 10.0,
+        "HP_ROI": None,                # [x1, y1, x2, y2] HP-бара
+        "HP_LOW_RATIO": 0.5,           # доля "красноты" >= этой → heal
+        "HEAL_TAP_XY": None,           # [x, y] — явные координаты кнопки лечения
+        "HEAL_BTN_TPL": None,          # альтернатива: путь к шаблону кнопки
+        "HEAL_BTN_THRESHOLD": 0.85,
+        "HEAL_POST_SLEEP_S": 0.6,
+        "DEBUG": False
     }
 }
 
