@@ -22,7 +22,11 @@ IGNORE_SKIP_SUBSTR = CFG.get("FIND", {}).get("IGNORE_SKIP_SUBSTR", False)
 IGNORE_WHITELIST = CFG.get("FIND", {}).get("IGNORE_WHITELIST", False)
 FORCE_FS_SCAN = CFG.get("FIND", {}).get("FORCE_FS_SCAN", False)
 ALLOWED_LOOT_DIRS = CFG.get("ALLOWED_LOOT_DIRS", [])
-PREPROC_MODE = CFG.get("FIND", {}).get("PREPROC_MODE", "scharr_v1")
+# Дефолт синхронизирован с tools/cfg/config.json::FIND.PREPROC_MODE ("gray").
+# Раньше здесь было "scharr_v1", что вводило в заблуждение при чтении кода —
+# фактически всегда использовался "gray" из config.json. Если нужен Scharr-фоллбек,
+# есть отдельный путь ниже через get_all_scharr_scaled.
+PREPROC_MODE = CFG.get("FIND", {}).get("PREPROC_MODE", "gray")
 
 FIND_THRESHOLD = float(CFG.get("FIND", {}).get("THRESHOLD", CFG.get("item_name_threshold", 0.86)))
 FIND_SCALES = list(CFG.get("FIND", {}).get("ITEM_SCALES", [0.95, 1.0, 1.05]))
