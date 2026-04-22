@@ -13,25 +13,83 @@ import cv2  # type: ignore[import-not-found]
 import numpy as np  # type: ignore[import-not-found]
 
 # ── Корневой путь проекта ────────────────────────────────────────────
-BASE_DIR = "C:/bot"
+# Порядок определения BASE_DIR:
+#   1. env var POCKET_BOT_ROOT (абсолютный путь) — для кастомной установки.
+#   2. bot_root() — автодетект по расположению utils.py (корень репо).
+#   3. Legacy "C:/bot" — только если ничего из вышеперечисленного не сработало.
+#
+# Любые пути, пришедшие из config.json или templates_registry.json с
+# префиксом "C:/bot/" (или плейсхолдером "${BOT_ROOT}"/"{BOT_ROOT}"),
+# при загрузке перенаправляются в BASE_DIR через resolve_bot_path().
+
+_LEGACY_ROOT = "C:/bot"
 
 
 def bot_root():
     """
-    Определяет корень проекта (C:\\bot) по расположению utils.py.
-    Возвращает путь, где есть папка tpl/templates и tools/cfg.
+    Определяет корень проекта по расположению utils.py или env var.
+    Возвращает путь, где лежат подпапки tpl/ и tools/cfg/.
     """
+    env_root = os.environ.get("POCKET_BOT_ROOT")
+    if env_root:
+        env_root = os.path.abspath(env_root).replace("\\", "/")
+        if os.path.isdir(env_root):
+            return env_root
+
     here = os.path.abspath(os.path.dirname(__file__))  # .../script/loot
     candidates = [
-        os.path.abspath(os.path.join(here, "..", "..")),  # C:\bot
-        os.path.abspath(os.path.join(here, "..")),        # C:\bot\script
+        os.path.abspath(os.path.join(here, "..", "..")),  # <repo_root>
+        os.path.abspath(os.path.join(here, "..")),        # <repo_root>/script
     ]
     for c in candidates:
+        c_norm = c.replace("\\", "/")
         tpl_ok = os.path.isdir(os.path.join(c, "tpl", "имя_предметов"))
         cfg_ok = os.path.isfile(os.path.join(c, "tools", "cfg", "config.json"))
-        if tpl_ok and (cfg_ok or os.path.isdir(os.path.join(c, "tools", "cfg"))):
-            return c
-    return os.path.abspath(os.path.join(here, "..", ".."))
+        # Предпочитаем каталог, где есть И tpl/, И tools/cfg/ — это корень репо.
+        if tpl_ok and cfg_ok:
+            return c_norm
+
+    # Fallback: если tpl/ отсутствует (его нет в гите) — используем репо-root,
+    # если там есть tools/cfg; иначе — legacy.
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "tools", "cfg", "config.json")):
+            return c.replace("\\", "/")
+
+    if os.path.isdir(_LEGACY_ROOT):
+        return _LEGACY_ROOT
+
+    return os.path.abspath(os.path.join(here, "..", "..")).replace("\\", "/")
+
+
+BASE_DIR = bot_root()
+
+
+def resolve_bot_path(p):
+    """
+    Нормализует путь из конфига к текущему BASE_DIR.
+
+    Поддерживает:
+      - legacy-префикс 'C:/bot' / 'c:/bot' / 'C:\\bot' — заменяется на BASE_DIR;
+      - плейсхолдеры '${BOT_ROOT}' / '{BOT_ROOT}' — заменяются на BASE_DIR;
+      - None / не-строку — возвращает как есть.
+
+    Возвращает путь с прямыми слэшами.
+    """
+    if not isinstance(p, str) or not p:
+        return p
+    s = p.replace("\\", "/")
+    for ph in ("${BOT_ROOT}/", "{BOT_ROOT}/", "${BOT_ROOT}", "{BOT_ROOT}"):
+        if s.startswith(ph):
+            return (BASE_DIR.rstrip("/") + "/" + s[len(ph):].lstrip("/")).replace("//", "/")
+    low = s.lower()
+    for prefix in ("c:/bot/", "c:\\bot\\", "c:\\bot/"):
+        if low.startswith(prefix):
+            rest = s[len(prefix):]
+            return (BASE_DIR.rstrip("/") + "/" + rest.replace("\\", "/").lstrip("/")).replace("//", "/")
+    # Точное совпадение "C:/bot" без слэша в конце.
+    if low in ("c:/bot", "c:\\bot"):
+        return BASE_DIR
+    return s
 
 
 # ── Пути ─────────────────────────────────────────────────────────────

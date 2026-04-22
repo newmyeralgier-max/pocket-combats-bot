@@ -2,10 +2,24 @@ import os
 import json
 from typing import Dict, Any
 
-from script.loot.utils import BASE_DIR, short_time_tag
+from script.loot.utils import BASE_DIR, short_time_tag, resolve_bot_path
 
 CFG_DIR = os.path.join(BASE_DIR, "tools", "cfg")
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
+
+
+def _resolve_paths_deep(obj: Any) -> Any:
+    """
+    Рекурсивно заменяет в config-объекте строки вида 'C:/bot/...' или
+    '${BOT_ROOT}/...' на текущий BASE_DIR. Остальные значения не трогаем.
+    """
+    if isinstance(obj, dict):
+        return {k: _resolve_paths_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_paths_deep(v) for v in obj]
+    if isinstance(obj, str):
+        return resolve_bot_path(obj)
+    return obj
 
 DEFAULT_CFG: Dict[str, Any] = {
     "use_slot_grouping": True,
@@ -68,7 +82,8 @@ def load_config() -> Dict[str, Any]:
                 json.dump(DEFAULT_CFG, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-    return cfg
+    # Перевод легаси C:/bot/... путей в актуальный BASE_DIR
+    return _resolve_paths_deep(cfg)
 
 CFG = load_config()
 
