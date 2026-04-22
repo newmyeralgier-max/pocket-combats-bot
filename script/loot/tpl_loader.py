@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import cv2
 import numpy as np
 
-from script.loot.utils import BASE_DIR, imread_u8 as _imread_u8
+from script.loot.utils import BASE_DIR, imread_u8 as _imread_u8, resolve_bot_path
 
 
 def _tpl(path: str) -> Optional[np.ndarray]:
@@ -46,6 +46,9 @@ def normalize_registry_entry(key, value):
       tpl   — путь к PNG
       group — всё до последней точки в ключе (например, 'skills.name')
       action — None по умолчанию
+
+    Все пути прогоняются через resolve_bot_path, чтобы легаси-префикс
+    'C:/bot/...' из registry автоматически транслировался в текущий BASE_DIR.
     """
     if isinstance(value, str):
         # Берём всё до последней точки, чтобы сохранить подгруппу
@@ -53,9 +56,12 @@ def normalize_registry_entry(key, value):
             group_name = key.rsplit(".", 1)[0]
         else:
             group_name = "default"
-        return {"tpl": value, "group": group_name, "action": None}
+        return {"tpl": resolve_bot_path(value), "group": group_name, "action": None}
     elif isinstance(value, dict):
-        return value
+        out = dict(value)
+        if isinstance(out.get("tpl"), str):
+            out["tpl"] = resolve_bot_path(out["tpl"])
+        return out
     else:
         raise TypeError(f"Unexpected type for registry entry {key}: {type(value)}")
 
@@ -94,9 +100,19 @@ def _norm_stem(s: str) -> str:
 def _load_cfg() -> Dict:
     try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
     except Exception:
         return {}
+    # Резолвим C:/bot/... → BASE_DIR рекурсивно, как в script.core.config.
+    def _walk(o):
+        if isinstance(o, dict):
+            return {k: _walk(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_walk(v) for v in o]
+        if isinstance(o, str):
+            return resolve_bot_path(o)
+        return o
+    return _walk(raw)
 
 
 CFG = _load_cfg()
