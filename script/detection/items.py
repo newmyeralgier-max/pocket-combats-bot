@@ -17,6 +17,7 @@ from script.loot.utils import clamp, get_thr, try_imread, to_gray, scharr_mag
 from script.loot.matcher import find_all_matches, TPL_CACHE, preprocess_gray
 from script.loot.tab_detector import detect_tab_states
 from script.loot.tpl_loader import load_item_name_templates_unified, get_item_score
+from script.detection import ocr as _ocr
 
 IGNORE_SKIP_SUBSTR = CFG.get("FIND", {}).get("IGNORE_SKIP_SUBSTR", False)
 IGNORE_WHITELIST = CFG.get("FIND", {}).get("IGNORE_WHITELIST", False)
@@ -349,6 +350,45 @@ def _raw_find_item_names(frame_bgr: np.ndarray, allowed_names: Optional[Set[str]
             "center": (ax + w // 2, ay + h // 2),
             "slot_hash": slot_hash,
         })
+
+    # ─── Опциональный OCR-проход (CFG.OCR.ENABLED) ────────────────
+    # Дополняет template-матчинг: OCR-хиты, которые не попадают по Y
+    # в уже найденные боксы, добавляются как дополнительные кандидаты.
+    # Выключено по умолчанию; не ломает существующее поведение.
+    ocr_cfg = CFG.get("OCR") or {}
+    if ocr_cfg.get("ENABLED"):
+        try:
+            ocr_hits = _ocr.detect_item_names_ocr(
+                frame_bgr,
+                roi=(x1, y1, x2, y2),
+                whitelist=(allowed_names or ALLOWED_ITEM_NAMES),
+                engine=str(ocr_cfg.get("ENGINE", "auto")),
+                fuzzy_min=float(ocr_cfg.get("FUZZY_MIN", 0.75)),
+                min_conf=float(ocr_cfg.get("MIN_CONF", 0.5)),
+            )
+        except Exception as e:
+            structured_log("ocr_pass_error", error=str(e))
+            ocr_hits = []
+        if ocr_hits:
+            sup_y = max(1, int(SUPPRESS_Y))
+            existing_y = [h["center"][1] for h in found]
+            added = 0
+            for h in ocr_hits:
+                cy = h["center"][1]
+                if any(abs(cy - ey) < sup_y for ey in existing_y):
+                    continue
+                found.append(h)
+                existing_y.append(cy)
+                added += 1
+            if added or ocr_cfg.get("DEBUG"):
+                structured_log(
+                    "ocr_pass",
+                    engine=_ocr.available_engine(str(ocr_cfg.get("ENGINE", "auto"))),
+                    raw_hits=len(ocr_hits),
+                    added=added,
+                    template_hits=len(found) - added,
+                )
+
     return found
 
 def find_item_names(get_frame_fn, allowed_names: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
