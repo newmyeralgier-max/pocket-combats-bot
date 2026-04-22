@@ -48,6 +48,16 @@ DEFAULT_CFG: Dict[str, Any] = {
         "SCHARR_FALLBACK_OFFSET": 0.03,
         "FIND_ITEM_NAME": 0.86,
         "SYSCHAT": 0.85
+    },
+    # Опциональный OCR-проход для имён предметов (см. script/detection/ocr.py).
+    # Требует отдельной установки rapidocr-onnxruntime или pytesseract.
+    # По умолчанию выключен — поведение бота не меняется.
+    "OCR": {
+        "ENABLED": False,
+        "ENGINE": "auto",
+        "FUZZY_MIN": 0.75,
+        "MIN_CONF": 0.5,
+        "DEBUG": False
     }
 }
 
