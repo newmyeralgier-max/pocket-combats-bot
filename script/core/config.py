@@ -48,7 +48,17 @@ DEFAULT_CFG: Dict[str, Any] = {
         "SCHARR_FALLBACK_OFFSET": 0.03,
         "FIND_ITEM_NAME": 0.86,
         "SYSCHAT": 0.85
-    }
+    },
+    # Эталонное разрешение, на котором изначально нарезались ROI/координаты
+    # (hp_bar, continue-fallback, ITEMS_ROI и т.п.). Используется в
+    # script/core/coords.py::scale_roi_from_ref при запуске на другом
+    # разрешении. См. README.
+    "REF_SCREEN_W": 1080,
+    "REF_SCREEN_H": 2460,
+    # Если true, при старте FSM первый кадр определит SCREEN_W/SCREEN_H
+    # и перепишет их в CFG; хелперы из script/core/coords.py будут
+    # автоматически использовать новые значения. По умолчанию выключено.
+    "SCREEN_AUTO_DETECT": False
 }
 
 def load_config() -> Dict[str, Any]:

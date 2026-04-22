@@ -20,6 +20,7 @@ from script.core.config import CFG
 from script.core.logging import structured_log, log as Logger
 from script.device.adb import screenshot_bgr, tap, tap_raw, device_swipe
 from script.loot.auto_bot import ensure_tab_state, detect_tabs_with_occlusion
+from script.core import coords as _coords
 
 SCREEN_W = int(CFG.get("SCREEN_W", 1080))
 SCREEN_H = int(CFG.get("SCREEN_H", 2460))
@@ -263,9 +264,10 @@ def fight_loop_until_victory():
             clicked = diag_click(continue_path, continue_thr_key, reason=f"{kind_tag}_continue", tap_fn=tap_raw)
         if not clicked:
             try:
-                tap_raw(SCREEN_W // 2, 2250, reason=f"{kind_tag}_continue_fallback")
+                fx, fy = _coords.rel_point(CFG, 0.5, 0.9146)  # 0.9146 ≈ 2250/2460
+                tap_raw(fx, fy, reason=f"{kind_tag}_continue_fallback")
                 time.sleep(rand_duration(0.05))
-                structured_log("fight_result_continue_fallback", kind=kind_tag, x=SCREEN_W // 2, y=2250)
+                structured_log("fight_result_continue_fallback", kind=kind_tag, x=fx, y=fy)
             except Exception as e:
                 structured_log("fight_result_continue_fallback", kind=kind_tag, result="error", error=str(e))
 
