@@ -15,7 +15,9 @@ import cv2  # type: ignore[import-not-found]
 
 from script.loot.matcher import find_all_matches, preprocess_gray, TPL_CACHE  # type: ignore[import-not-found]
 from script.overlays.clear_overlays import clear_overlays, overlay_just_appeared  # type: ignore[import-not-found]
+from script.overlays.heal import perform_heal  # type: ignore[import-not-found]
 from script.fight.fight import fight_loop_until_victory  # type: ignore[import-not-found]
+from script.detection.player_status import detect_dead, compute_hp_ratio  # type: ignore[import-not-found]
 
 # ── Runtime from auto_bot & other modules ────────────────────────────
 auto_bot = importlib.import_module("script.loot.auto_bot")
@@ -250,6 +252,29 @@ def fsm_loop():
             log("[FSM] recovering")
             # Никаких табов тут — только быстро прибираем оверлеи и возвращаемся искать
             clear_overlays(CFG, cooldown_s=0.0, log_no_overlay=False)
+
+            # Опциональные проверки HP/смерти. Работают только если
+            # CFG.RECOVER.ENABLED = true; без флага всё как раньше.
+            recover_cfg = CFG.get("RECOVER") or {}
+            if recover_cfg.get("ENABLED"):
+                fr = screenshot_bgr()
+                if fr is not None:
+                    try:
+                        if detect_dead(fr, CFG):
+                            wait_s = float(recover_cfg.get("DEAD_WAIT_S", 10.0) or 10.0)
+                            structured_log("fsm_recover_dead", wait_s=wait_s)
+                            time.sleep(wait_s)
+                        else:
+                            hp_ratio = compute_hp_ratio(fr, CFG)
+                            low_thr = float(recover_cfg.get("HP_LOW_RATIO", 0.5) or 0.5)
+                            if hp_ratio is not None and hp_ratio >= low_thr:
+                                structured_log("fsm_recover_heal_attempt", hp_ratio=float(hp_ratio), low_thr=low_thr)
+                                ok = perform_heal(CFG, frame_bgr=fr)
+                                structured_log("fsm_recover_heal_result", healed=bool(ok))
+                            elif recover_cfg.get("DEBUG"):
+                                structured_log("fsm_recover_hp_ok", hp_ratio=(float(hp_ratio) if hp_ratio is not None else None))
+                    except Exception as e:
+                        structured_log("fsm_recover_error", error=str(e))
             current_state = STATE_FIND
 
         # Логим конец шага
